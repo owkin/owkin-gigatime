@@ -1,0 +1,29 @@
+!!python/object/new:easydict.EasyDict
+dictitems:
+  arch: gigatime
+  batch_size: 32
+  epochs: 1
+  gpu_ids: null
+  input_channels: 3
+  input_h: 512
+  input_w: 512
+  loss: BCEDiceLoss
+  metadata: ./../data/sample_metadata.csv
+  name: gigatime_training
+  num_classes: 23
+  output_dir: ./scratch/
+  tiling_dir: ./../data/sample_test_data/data/
+state:
+  arch: gigatime
+  batch_size: 32
+  epochs: 1
+  gpu_ids: null
+  input_channels: 3
+  input_h: 512
+  input_w: 512
+  loss: BCEDiceLoss
+  metadata: ./../data/sample_metadata.csv
+  name: gigatime_training
+  num_classes: 23
+  output_dir: ./scratch/
+  tiling_dir: ./../data/sample_test_data/data/

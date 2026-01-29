@@ -43,29 +43,30 @@ import losses
 from utils import AverageMeter, str2bool
 from prov_data import *
 
-channel_names=['DAPI', 
-    'TRITC',
-    'Cy5', 
-    'PD-1_1:200 - Cy5', 
-    'CD14 - Cy5',
-    'CD4 - Cy5',
-    'T-bet - Cy5', 
-    'CD34 - Cy5', 
-    'CD68_1:100 - TRITC', 
-    'CD16 - Cy5', 
-    'CD11c - Cy5',
-    'CD138 - TRITC',
-    'CD20 - TRITC',
-    'CD3_1:1000 - Cy5',
-    'CD8 - TRITC', 
-    'PD-L1 - Cy5', 
-    'CK_1:150 - TRITC', 
-    'Ki67_1:150 - TRITC',
-    'Tryptase - TRITC',
-    'Actin-D - TRITC',
-    'Caspase3-D - Cy5',
-    'PHH3-B - Cy5',
-    'Transgelin - TRITC']
+common_channel_list=['DAPI', 
+    'TRITC', #background channel not used in analysis
+    'Cy5', #background channel not used in analysis
+    'PD-1', 
+    'CD14',
+    'CD4',
+    'T-bet', 
+    'CD34', 
+    'CD68', 
+    'CD16', 
+    'CD11c',
+    'CD138',
+    'CD20',
+    'CD3',
+    'CD8',
+    'PD-L1',
+    'CK',
+    'Ki67',
+    'Tryptase',
+    'Actin-D',
+    'Caspase3-D',
+    'PHH3-B',
+    'Transgelin']
+channel_names = common_channel_list
 
 ARCH_NAMES = archs.__all__
 LOSS_NAMES = losses.__all__

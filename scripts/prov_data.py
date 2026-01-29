@@ -31,8 +31,29 @@ logging.basicConfig(level=logging.INFO)
 logging.getLogger("py4j").setLevel(logging.ERROR)
 
 
-common_channel_list=['DAPI', 'TRITC', 'Cy5', 'Caspase 3 - Cy5', 'Transgelin - TRITC', 'T-bet - Cy5', 'Actin - TRITC', 'CD4 - Cy5', 'CD68 - TRITC', 'CD34 - Cy5', 'Ki67 - TRITC', 'CD11c - Cy5', 'Tryptase - TRITC', 'CD14 - Cy5', 'CK - TRITC', 'CD3 - Cy5', 'CD8 - TRITC', 'CD66b - Cy5', 'CD20 - TRITC', 'PD-1 - Cy5', 'CD138 - TRITC', 'PDL-1 - Cy5', 'CD16 - Cy5']
-
+common_channel_list=['DAPI', 
+    'TRITC', #background channel not used in analysis
+    'Cy5', #background channel not used in analysis
+    'PD-1', 
+    'CD14',
+    'CD4',
+    'T-bet', 
+    'CD34', 
+    'CD68', 
+    'CD16', 
+    'CD11c',
+    'CD138',
+    'CD20',
+    'CD3',
+    'CD8',
+    'PD-L1',
+    'CK',
+    'Ki67',
+    'Tryptase',
+    'Actin-D',
+    'Caspase3-D',
+    'PHH3-B',
+    'Transgelin']
 
 def update_dict_with_key_check(target_dict, source_dict, key_list=None):
     """
