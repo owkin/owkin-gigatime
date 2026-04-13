@@ -1,119 +1,110 @@
-# GigaTIME: Multimodal AI generates virtual population for tumor microenvironment modeling (Cell)
+# GigaTIME — Owkin Fork
 
-<div align="center">
+This is Owkin's fork of the [original GigaTIME repository](https://github.com/prov-gigatime/GigaTIME) (Microsoft Research / Providence). The original code is preserved under `legacy_gigatime_repo/`. This fork repackages the model as a clean Python library aimed at running inference on Owkin's platforms.
 
-[![Paper](https://img.shields.io/badge/Paper-Cell-red.svg)](https://aka.ms/gigatime-paper)
-[![Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-yellow)](https://aka.ms/gigatime-model)
-[![License](https://img.shields.io/badge/License-Research%20Only-blue.svg)](https://github.com/prov-gigatime/GigaTIME/blob/main/LICENSE)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
-[![Microsoft](https://img.shields.io/badge/Microsoft-Research-00A4EF.svg?logo=microsoft)](https://www.microsoft.com/en-us/research/)
+> **Paper:** [GigaTIME: Multimodal AI generates virtual population for tumor microenvironment modeling](https://aka.ms/gigatime-paper) — *Cell*
+> **Model weights:** [prov-gigatime/GigaTIME on HuggingFace](https://huggingface.co/prov-gigatime/GigaTIME) (access requires accepting the terms of use)
 
+---
 
-*Official implementation of GigaTIME*
+## What GigaTIME does
 
-[📄 Paper](https://aka.ms/gigatime-paper) • [🤗 Model Card](https://aka.ms/gigatime-model) 
+GigaTIME takes a standard H&E tile and predicts 23 virtual multiplexed immunofluorescence (mIF) channels — including CD3, CD8, CD4, CD68, PD-L1, Ki67, and CK — using a UNet++ architecture trained on the HE-COMET dataset.
 
-</div>
+Input requirements: **512×512 px RGB tiles at ~20x magnification (0.5 µm/px)**.
 
-## Environment Setup
+---
 
-We recommend using Conda for environment management. The codebase has been tested with Python 3.11 using A100 GPUs for optimal reproducibility. Before creating the environment, ensure that the `torch` version specified in `environment.yml` matches your GPU and CUDA driver setup.
+## Setup
 
-To set up the environment, run:
+Requires [uv](https://github.com/astral-sh/uv).
 
 ```bash
-conda env create -f environment.yml
+uv sync            # inference only
+uv sync --extra train      # + training dependencies
+uv sync --extra notebooks  # + Jupyter
 ```
 
-This will create a Conda environment named `gigatime`. Activate it with:
+Set your HuggingFace token to download the model weights:
 
 ```bash
-conda activate gigatime
+export HF_TOKEN=<your-huggingface-read-only-token>
 ```
 
-## Data 
+---
 
-A set of 50 paired H&E and mIF patches from the test set is available for evaluation. Download the sample data from [Dropbox](https://www.dropbox.com/scl/fi/8ampg43fs2yowt9y6vvr1/sample_test_data.zip?rlkey=bkg4w183qnvkh2dudqy3d8lsg&st=j2l463ug&dl=0).
+## Usage
 
-After downloading, unzip the folder and place it in the `data` directory:
-
-```bash
-unzip sample_test_data.zip -d ./data/
-```
-
-Make sure the extracted folder are located in `./data/`.
-
-## Pre-trained Model
-
-Model card available in [HuggingFace](https://huggingface.co/prov-gigatime/GigaTIME) 
-
-You need to agree to the terms to access the models. Once you have the necessary access, set your HuggingFace read-only token as an environment variable:
-```
-export HF_TOKEN=<huggingface read-only token>
-```
-
-If you don’t set the token, you might encounter the following error:
-```
-ValueError: We have no connection or you passed local_files_only, so force_download is not an accepted option.
-```
-
-Once that is done, you can load your model like this:
+### As a library
 
 ```python
-from huggingface_hub import snapshot_download
-import torch
+from gigatime import load_model, predict
+from gigatime.data import SlideReader, iter_tiles, stitch
 
-repo_id = "prov-gigatime/GigaTIME"
-local_dir = snapshot_download(repo_id=repo_id)
+# Load model (downloads weights from HuggingFace if no path given)
+model = load_model(device="cuda")
 
-weights_path = os.path.join(local_dir, "model.pth")
-state_dict = torch.load(weights_path, map_location="cpu")
-model.load_state_dict(state_dict)
+# Open a WSI — resolution is handled automatically
+results = []
+with SlideReader("path/to/slide.svs") as reader:
+    for tile, grid in iter_tiles(reader, tile_size=512, overlap=32, min_tissue_fraction=0.1):
+        pred = predict(tile.array, model, device="cuda")
+        results.append((pred, tile))
+
+# Reassemble a slide-level prediction map
+cd8_map = stitch(results, grid, channel="CD8", mode="mean")  # (H, W) float32
 ```
 
-## Tutorials
+### From S3
 
-- **Inference Tutorial:** 
+```python
+from gigatime.data import list_slides, download_slide
 
-Learn how to load the model and run predictions on sample patches: [scripts/gigatime_testing.ipynb](scripts/gigatime_testing.ipynb)
+uris = list_slides("my-bucket", prefix="cohort/slides/")
+local_path = download_slide(uris[0], dest_dir="/tmp/slides")
+```
 
-- **Training Tutorial:** 
-
-Understand the training workflow with a one-epoch demo: [scripts/gigatime_training.ipynb](scripts/gigatime_training.ipynb)
-
-## Training GigaTIME cross-modal translator
-
-We also release the script needed to train the GigaTIME model here. 
-
-To train the model:
+### CLI
 
 ```bash
-python scripts/db_train.py --arch gigatime   --tiling_dir "gigatime_training_path"  --window_size 256       --batch_size 32     --sampling_prob 1     --name GigaTIME_model    --output_dir "Output_Directory"    --epoch 300 --input_h 512 --input_w 512 --lr 0.001 --loss BCEDiceLoss --val_sampling_prob 1 --num_workers 12 --gpu_ids 0 1 2 3 4 5 6 7 --crop True --metadata "Gigatime metadata file"
+uv run gigatime-infer \
+  --input tiles/ \
+  --output_dir ./results \
+  --device cuda \
+  --overlap 32
 ```
 
-## Model Uses
+---
 
-### Intended Use
-The data, code, and model checkpoints are intended to be used solely for (I) future research on pathology AI models and (II) reproducibility of the experimental results reported in the reference paper. The data, code, and model checkpoints are not intended to be used in clinical care or for any clinical decision-making purposes.
-
-### Primary Intended Use
-The primary intended use is to support AI researchers reproducing and building on top of this work. GigaTIME should be helpful for generating virtual mIF profiles from routine H&E pathology slides.
-
-### Out-of-Scope Use
-Any deployed use case of the model --- commercial or otherwise --- is out of scope. Although we evaluated the models using a broad set of publicly-available research benchmarks, the models and evaluations are intended for research use only and not intended for deployed use cases.
-
-## License Notice
-
-The model is not intended or made available for clinical use as a medical device, clinical support, diagnostic tool, or other technology intended to be used in the diagnosis, cure, mitigation, treatment, or prevention of disease or other conditions. The model is not designed or intended to be a substitute for professional medical advice, diagnosis, treatment, or judgment and should not be used as such. All users are responsible for reviewing the output of the developed model to determine whether the model meets the user’s needs and for validating and evaluating the model before any clinical use.
-
-## Citation
+## Repository structure
 
 ```
-@article{valanarasu2025multimodal,
-  title={Multimodal AI generates virtual population for tumor microenvironment modeling},
-  author={Valanarasu, Jeya Maria Jose and Xu, Hanwen and Usuyama, Naoto and Kim, Chanwoo and Wong, Cliff and Argaw, Peniel and Shimol, Racheli Ben and Crabtree, Angela and Matlock, Kevin and Bartlett, Alexandra Q and others},
-  journal={Cell},
-  year={2025},
-  publisher={Elsevier}
-}
+gigatime/               # main Python package
+├── model.py            # GigaTIME architecture + weight loading
+├── predict.py          # inference logic (sliding window)
+├── constants.py        # channel names, tile size, normalisation
+├── cli.py              # command-line interface
+└── data/
+    ├── s3.py           # S3 slide discovery and download
+    ├── slide.py        # OpenSlide wrapper (auto level selection)
+    └── tiling.py       # tile iterator and slide-level stitching
+legacy_gigatime_repo/   # original Microsoft / Providence code (unmodified)
+pyproject.toml          # uv-managed dependencies
 ```
+
+---
+
+## Output channels
+
+| Index | Channel | Notes |
+|---|---|---|
+| 0 | DAPI | Nuclear stain |
+| 1 | TRITC | Background — excluded from analysis |
+| 2 | Cy5 | Background — excluded from analysis |
+| 3–22 | PD-1, CD14, CD4, T-bet, CD34, CD68, CD16, CD11c, CD138, CD20, CD3, CD8, PD-L1, CK, Ki67, Tryptase, Actin-D, Caspase3-D, PHH3-B, Transgelin | |
+
+---
+
+## License
+
+Model weights and original code are subject to the [original research-only license](legacy_gigatime_repo/LICENSE). This fork inherits the same terms.
