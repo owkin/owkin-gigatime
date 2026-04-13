@@ -64,6 +64,7 @@ def iter_tiles(
     tile_size: int = TILE_SIZE_PX,
     overlap: int = 0,
     min_tissue_fraction: float = 0.0,
+    progress: bool = False,
 ) -> Generator[tuple[Tile, TileGrid], None, None]:
     """Yield tiles from a slide together with the grid layout.
 
@@ -79,6 +80,8 @@ def iter_tiles(
         overlap: Overlap between adjacent tiles in pixels.
         min_tissue_fraction: Skip tiles where the fraction of non-white pixels
             is below this threshold. Use 0.0 (default) to keep all tiles.
+        progress: If ``True``, display a tqdm progress bar over all candidate
+            tiles (before tissue filtering).
 
     Yields:
         ``(tile, grid)`` tuples.
@@ -103,40 +106,48 @@ def iter_tiles(
 
     level_ds = reader._slide.level_downsamples[reader.read_level]
 
-    for row in range(n_rows):
-        for col in range(n_cols):
-            # Coordinates in read-level pixels
-            x_level = col * step
-            y_level = row * step
+    coords = ((row, col) for row in range(n_rows) for col in range(n_cols))
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+        except ImportError as e:
+            raise ImportError("tqdm is required for progress=True: pip install tqdm") from e
+        coords = tqdm(coords, total=grid.n_tiles, unit="tile", desc="Tiling")
 
-            # Clamp to slide boundaries
-            read_w = min(tile_size, slide_w - x_level)
-            read_h = min(tile_size, slide_h - y_level)
+    for row, col in coords:
+        # Coordinates in read-level pixels
+        x_level = col * step
+        y_level = row * step
 
-            # Convert back to level-0 coordinates for OpenSlide
-            x0 = int(x_level * level_ds)
-            y0 = int(y_level * level_ds)
+        # Clamp to slide boundaries
+        read_w = min(tile_size, slide_w - x_level)
+        read_h = min(tile_size, slide_h - y_level)
 
-            region = reader.read_region(x0, y0, read_w, read_h)
+        # Convert back to level-0 coordinates for OpenSlide
+        x0 = int(x_level * level_ds)
+        y0 = int(y_level * level_ds)
 
-            # Rescale if the read level doesn't exactly match target MPP
-            if abs(reader.read_downsample - 1.0) > 1e-3:
-                target_w = round(read_w / reader.read_downsample)
-                target_h = round(read_h / reader.read_downsample)
-                region = np.array(
-                    Image.fromarray(region).resize((target_w, target_h), Image.Resampling.LANCZOS)
-                )
+        region = reader.read_region(x0, y0, read_w, read_h)
 
-            # Pad partial tiles to full tile_size with white
-            if region.shape[0] != tile_size or region.shape[1] != tile_size:
-                padded = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
-                padded[: region.shape[0], : region.shape[1]] = region
-                region = padded
+        # Rescale if the read level doesn't exactly match target MPP
+        if abs(reader.read_downsample - 1.0) > 1e-3:
+            target_w = round(read_w / reader.read_downsample)
+            target_h = round(read_h / reader.read_downsample)
+            region = np.array(
+                Image.fromarray(region).resize((target_w, target_h), Image.Resampling.LANCZOS)
+            )
 
-            if min_tissue_fraction > 0.0 and not _has_tissue(region, min_tissue_fraction):
-                continue
+        # Crop oversized tiles (rounding in rescale can add 1-2 px) then pad partial tiles
+        region = region[:tile_size, :tile_size]
+        if region.shape[0] != tile_size or region.shape[1] != tile_size:
+            padded = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
+            padded[: region.shape[0], : region.shape[1]] = region
+            region = padded
 
-            yield Tile(array=region, row=row, col=col, x=x0, y=y0, tile_size=tile_size), grid
+        if min_tissue_fraction > 0.0 and not _has_tissue(region, min_tissue_fraction):
+            continue
+
+        yield Tile(array=region, row=row, col=col, x=x0, y=y0, tile_size=tile_size), grid
 
 
 def stitch(

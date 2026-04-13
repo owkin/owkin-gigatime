@@ -21,6 +21,7 @@ def predict(
     threshold: float = 0.5,
     window_size: int = INFERENCE_WINDOW_SIZE,
     overlap: int = 0,
+    return_probabilities: bool = False,
 ) -> dict[str, np.ndarray]:
     """Run GigaTIME on a single H&E image array.
 
@@ -35,12 +36,15 @@ def predict(
         overlap: Overlap between adjacent windows in pixels. Overlapping
             regions are averaged to reduce boundary artefacts. Must be
             strictly less than ``window_size``.
+        return_probabilities: If ``True``, include a ``"probabilities"`` key
+            with the raw (H, W, C) float32 array before thresholding.
+            Defaults to ``False`` to save memory.
 
     Returns:
         Dictionary mapping channel name → binary prediction mask (H, W) as
         a float32 numpy array with values in {0, 1}.
-        Also includes a ``"probabilities"`` key with the raw (H, W, C) float32
-        probability array before thresholding.
+        If ``return_probabilities=True``, also includes a ``"probabilities"``
+        key with the raw (H, W, C) float32 probability array.
     """
     if overlap >= window_size:
         raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
@@ -49,7 +53,9 @@ def predict(
     probs = _sliding_window_inference(tensor, model, window_size, overlap)  # (1, C, H, W)
     probs_np = probs.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, C)
 
-    result: dict[str, np.ndarray] = {"probabilities": probs_np}
+    result: dict[str, np.ndarray] = {}
+    if return_probabilities:
+        result["probabilities"] = probs_np
     for i, name in enumerate(CHANNEL_NAMES):
         result[name] = (probs_np[..., i] >= threshold).astype(np.float32)
 
