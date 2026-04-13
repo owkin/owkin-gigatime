@@ -73,21 +73,12 @@ config-sagemaker: ## Configure .netrc with Owkin's PyPi credentials
 	fi; \
 
 install: clean  ## Install all package and development dependencies for testing to the active Python's site-packages
-	@export PATH=$$HOME/.local/bin:$$PATH && export LD_LIBRARY_PATH=$$HOME/.local/lib:$$LD_LIBRARY_PATH && \
 	uv sync --all-extras && \
-	git submodule update --init histalign && \
-	uv pip install ./histalign && \
-	chmod +x ./histalign/src/install-elastix.sh && bash ./histalign/src/install-elastix.sh && \
-	elastix --version || (echo "❌ Elastix installation failed."; exit 1)
 	@if ! grep -q 'export PATH=$$HOME/.local/bin:$$PATH' ~/.bashrc 2>/dev/null; then \
 		echo 'export PATH=$$HOME/.local/bin:$$PATH' >> ~/.bashrc; \
 	fi
-	@if ! grep -q 'export LD_LIBRARY_PATH=$$HOME/.local/lib:$$LD_LIBRARY_PATH' ~/.bashrc 2>/dev/null; then \
-		echo 'export LD_LIBRARY_PATH=$$HOME/.local/lib:$$LD_LIBRARY_PATH' >> ~/.bashrc; \
-	fi
 	@if [ -f ~/.zshrc ]; then \
 		grep -q 'export PATH=$$HOME/.local/bin:$$PATH' ~/.zshrc || echo 'export PATH=$$HOME/.local/bin:$$PATH' >> ~/.zshrc; \
-		grep -q 'export LD_LIBRARY_PATH=$$HOME/.local/lib:$$LD_LIBRARY_PATH' ~/.zshrc || echo 'export LD_LIBRARY_PATH=$$HOME/.local/lib:$$LD_LIBRARY_PATH' >> ~/.zshrc; \
 	fi
 
 clean: clean-build clean-pyc clean-test clean-docs ## Remove all build, test, coverage and Python artifacts
