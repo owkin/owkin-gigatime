@@ -1,11 +1,22 @@
 """Model loading utilities."""
 
+import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 from .constants import CHANNEL_NAMES, HF_REPO_ID
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_HF_TOKEN_FILE = _REPO_ROOT / ".hf_token"
+
+
+def _get_hf_token() -> str | None:
+    if _HF_TOKEN_FILE.exists():
+        return _HF_TOKEN_FILE.read_text().strip()
+    return os.environ.get("HF_TOKEN")
+
 
 # ---------------------------------------------------------------------------
 # Architecture (inlined from scripts/archs.py to keep inference self-contained)
@@ -15,17 +26,15 @@ from .constants import CHANNEL_NAMES, HF_REPO_ID
 class _VGGBlock(nn.Module):
     def __init__(self, in_channels: int, middle_channels: int, out_channels: int):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, middle_channels, 3, padding=1),
-            nn.BatchNorm2d(middle_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(middle_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(in_channels, middle_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(middle_channels)
+        self.conv2 = nn.Conv2d(middle_channels, out_channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        x = self.relu(self.bn1(self.conv1(x)))
+        return self.relu(self.bn2(self.conv2(x)))
 
 
 class GigaTIME(nn.Module):
@@ -127,5 +136,5 @@ def _download_weights() -> Path:
             "Install it with: pip install huggingface-hub"
         ) from e
 
-    local_dir = snapshot_download(repo_id=HF_REPO_ID)
+    local_dir = snapshot_download(repo_id=HF_REPO_ID, token=_get_hf_token())
     return Path(local_dir) / "model.pth"
