@@ -8,7 +8,7 @@ from typing import Generator
 import numpy as np
 from PIL import Image
 
-from ..constants import CHANNEL_NAMES, TILE_SIZE_PX
+from ..inference.constants import CHANNEL_NAMES, TILE_SIZE_PX
 from .slide import SlideReader
 
 
