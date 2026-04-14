@@ -73,13 +73,12 @@ config-sagemaker: ## Configure .netrc with Owkin's PyPi credentials
 	fi; \
 
 install: clean  ## Install all package and development dependencies for testing to the active Python's site-packages
-	uv sync --all-extras && \
-	@if ! grep -q 'export PATH=$$HOME/.local/bin:$$PATH' ~/.bashrc 2>/dev/null; then \
-		echo 'export PATH=$$HOME/.local/bin:$$PATH' >> ~/.bashrc; \
-	fi
-	@if [ -f ~/.zshrc ]; then \
-		grep -q 'export PATH=$$HOME/.local/bin:$$PATH' ~/.zshrc || echo 'export PATH=$$HOME/.local/bin:$$PATH' >> ~/.zshrc; \
-	fi
+	uv sync --all-extras
+	@for rc in ~/.bashrc ~/.zshrc; do \
+		if [ -f "$$rc" ] && ! grep -q 'export PATH=$$HOME/.local/bin:$$PATH' "$$rc"; then \
+			echo 'export PATH=$$HOME/.local/bin:$$PATH' >> "$$rc"; \
+		fi \
+	done
 
 clean: clean-build clean-pyc clean-test clean-docs ## Remove all build, test, coverage and Python artifacts
 
