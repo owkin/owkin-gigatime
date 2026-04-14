@@ -1,4 +1,4 @@
-"""Interactive python script to run inference of gigatime on TCGA HE slides."""
+"""Interactive python script to run inference of gigatime on HE slides."""
 
 # %%
 from pathlib import Path
@@ -11,7 +11,7 @@ from abstra.manifest import Manifest
 from PIL import Image
 
 from gigatime.data import SlideReader, iter_tiles, list_slides, stitch
-from gigatime.data.paths import TCGA_LUAD
+from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_OV, TCGA_LUAD
 from gigatime.inference import load_model, predict
 from gigatime.inference.constants import CHANNEL_NAMES
 
@@ -19,12 +19,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
 # %%
-# Find the available images
+# --- Choose dataset ---
+AVAILABLE_DATASETS = [TCGA_LUAD, MOSAIC_BLCA, MOSAIC_OV]
+DATASET = AVAILABLE_DATASETS[1]  # change key to switch datasets
+
 manifest = Manifest().load()
-dataset = manifest.datasets[TCGA_LUAD]
+dataset = manifest.datasets[DATASET]
 slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
 
-print(f"Found {len(slides)} slides in TCGA-LUAD")
+print(f"Found {len(slides)} slides in {dataset.name}")
 for i, uri in enumerate(slides[:10]):
     print(f"  [{i}] {Path(uri).name}")
 
