@@ -1,3 +1,3 @@
-from .features import compute_features
+from .features import compute_features, compute_features_from_tiles
 
-__all__ = ["compute_features"]
+__all__ = ["compute_features", "compute_features_from_tiles"]
