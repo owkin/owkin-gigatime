@@ -5,7 +5,8 @@
 %autoreload 2
 
 # %%
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -16,10 +17,13 @@ from tqdm import tqdm
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
-from gigatime.inference import load_model, predict
+from gigatime.inference import load_model, predict_batch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
+
+BATCH_SIZE = 16   # tiles per forward pass — increase if GPU memory allows
+PREFETCH   = 48   # tiles buffered ahead by the reader thread
 
 # Channels consumed by SlideFeatureAccumulator.
 FEATURE_CHANNELS = [
@@ -41,32 +45,63 @@ model = load_model(device=DEVICE)
 model.eval()
 
 # %%
-# Pipelined inference + feature accumulation:
-#   GPU runs inference on tile N+1 while CPU accumulates features for tile N.
-#   SlideFeatureAccumulator keeps only running integer counters — O(1) memory
-#   regardless of slide size (no tile predictions are buffered).
+# Pipelined inference + feature accumulation.
+#
+# Architecture:
+#   [Thread] iter_tiles → tissue filter → queue
+#   [Main]   queue → predict_batch (GPU) → SlideFeatureAccumulator
+#
+# The reader thread hides OpenSlide I/O latency behind GPU inference.
+# Batched inference amortises the per-forward-pass overhead.
+# SlideFeatureAccumulator keeps only running integer counters — O(1) memory.
 reader = SlideReader(slide_uri)
+_w, _h = reader.dimensions_at_read_level
+_step = 512  # default tile_size with no overlap
+_n_grid_tiles = max(1, -(-_w // _step)) * max(1, -(-_h // _step))  # ceil division
+
+
+def _prefetch_tiles(reader, min_tissue_fraction: float, maxsize: int):
+    """Yield (tile, grid) from a background reader thread."""
+    q: queue.Queue = queue.Queue(maxsize=maxsize)
+    _DONE = object()
+
+    def _run() -> None:
+        try:
+            for item in iter_tiles(reader, min_tissue_fraction=min_tissue_fraction):
+                q.put(item)
+        finally:
+            q.put(_DONE)
+
+    threading.Thread(target=_run, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is _DONE:
+            break
+        yield item
+
+
 grid = None
 acc: SlideFeatureAccumulator | None = None
-future = None
+buf: list = []
 
-
-def _accumulate(preds, tile):
-    acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile)
-
-
-with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
-    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
+with torch.inference_mode():
+    for tile, grid in tqdm(
+        _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=PREFETCH),
+        desc="Inference",
+        total=_n_grid_tiles,
+    ):
         if acc is None:
             acc = SlideFeatureAccumulator(grid)
-        preds = predict(tile.array, model, device=DEVICE)
+        buf.append(tile)
+        if len(buf) < BATCH_SIZE:
+            continue
+        for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=DEVICE)):
+            acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
+        buf.clear()
 
-        if future is not None:
-            future.result()
-        future = executor.submit(_accumulate, preds, tile)
-
-    if future is not None:
-        future.result()
+    if buf:  # flush last partial batch
+        for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=DEVICE)):
+            acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
 
 reader.close()
 assert grid is not None, "No tissue tiles found"

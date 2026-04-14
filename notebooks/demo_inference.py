@@ -108,8 +108,12 @@ def _process_tile(tile, preds, grid, step):
 
 tile_buf: list = []
 
+_w, _h = reader.dimensions_at_read_level
+_step = 512  # default tile_size with no overlap
+_n_grid_tiles = max(1, -(-_w // _step)) * max(1, -(-_h // _step))  # ceil division
+
 with torch.inference_mode():
-    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
+    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference", total=_n_grid_tiles):
         if not vis_canvas:
             step = grid.tile_size - grid.overlap
             vis_scale = CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
