@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,6 +36,13 @@ class SlideReader:
     """
 
     def __init__(self, path: str | Path) -> None:
+        self._tmp_dir: tempfile.TemporaryDirectory | None = None
+        path = str(path)
+        if path.startswith("s3://"):
+            from .s3 import download_slide
+
+            self._tmp_dir = tempfile.TemporaryDirectory()
+            path = str(download_slide(path, dest_dir=self._tmp_dir.name))
         self.path = Path(path)
         self._slide = openslide.OpenSlide(str(self.path))
         self.metadata = self._read_metadata()
@@ -48,6 +56,9 @@ class SlideReader:
 
     def close(self) -> None:
         self._slide.close()
+        if self._tmp_dir is not None:
+            self._tmp_dir.cleanup()
+            self._tmp_dir = None
 
     # ------------------------------------------------------------------
     # Public API

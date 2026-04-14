@@ -1,6 +1,6 @@
 # GigaTIME — Owkin Fork
 
-This is Owkin's fork of the [original GigaTIME repository](https://github.com/prov-gigatime/GigaTIME) (Microsoft Research / Providence). The original code is preserved under `legacy_gigatime_repo/`. This fork repackages the model as a clean Python library aimed at running inference on Owkin's platforms.
+Owkin's fork of the [original GigaTIME repository](https://github.com/prov-gigatime/GigaTIME) (Microsoft Research / Providence). The original code is preserved under `legacy_gigatime_repo/`. This fork repackages the model as a clean Python library aimed at running inference on Owkin's platforms.
 
 > **Paper:** [GigaTIME: Multimodal AI generates virtual population for tumor microenvironment modeling](https://aka.ms/gigatime-paper) — *Cell*
 > **Model weights:** [prov-gigatime/GigaTIME on HuggingFace](https://huggingface.co/prov-gigatime/GigaTIME) (access requires accepting the terms of use)
@@ -20,15 +20,16 @@ Input requirements: **512×512 px RGB tiles at ~20x magnification (0.5 µm/px)**
 Requires [uv](https://github.com/astral-sh/uv).
 
 ```bash
-uv sync            # inference only
+uv sync                    # inference only
 uv sync --extra train      # + training dependencies
 uv sync --extra notebooks  # + Jupyter
 ```
 
-Set your HuggingFace token to download the model weights:
+Store your HuggingFace token in `.hf_token` (already gitignored) and export it before running:
 
 ```bash
-export HF_TOKEN=<your-huggingface-read-only-token>
+echo "hf_..." > .hf_token
+export HF_TOKEN=$(cat .hf_token)
 ```
 
 ---
@@ -38,7 +39,7 @@ export HF_TOKEN=<your-huggingface-read-only-token>
 ### As a library
 
 ```python
-from gigatime import load_model, predict
+from gigatime.inference import load_model, predict
 from gigatime.data import SlideReader, iter_tiles, stitch
 
 # Load model (downloads weights from HuggingFace if no path given)
@@ -74,22 +75,29 @@ uv run gigatime-infer \
   --overlap 32
 ```
 
+### Notebook
+
+An end-to-end example running inference on TCGA-LUAD slides is at [`notebooks/inference_tcga_luad.py`](notebooks/inference_tcga_luad.py).
+
 ---
 
 ## Repository structure
 
 ```
-gigatime/               # main Python package
-├── model.py            # GigaTIME architecture + weight loading
-├── predict.py          # inference logic (sliding window)
-├── constants.py        # channel names, tile size, normalisation
-├── cli.py              # command-line interface
+gigatime/                   # main Python package
+├── inference/
+│   ├── model.py            # GigaTIME architecture + weight loading
+│   ├── predict.py          # inference logic (sliding window)
+│   ├── constants.py        # channel names, tile size, normalisation
+│   └── cli.py              # command-line interface
 └── data/
-    ├── s3.py           # S3 slide discovery and download
-    ├── slide.py        # OpenSlide wrapper (auto level selection)
-    └── tiling.py       # tile iterator and slide-level stitching
-legacy_gigatime_repo/   # original Microsoft / Providence code (unmodified)
-pyproject.toml          # uv-managed dependencies
+    ├── s3.py               # S3 slide discovery and download
+    ├── slide.py            # OpenSlide wrapper (auto level selection)
+    ├── tiling.py           # tile iterator and slide-level stitching
+    └── paths.py            # dataset path constants
+notebooks/                  # worked examples
+legacy_gigatime_repo/       # original Microsoft / Providence code (unmodified)
+pyproject.toml              # uv-managed dependencies
 ```
 
 ---
