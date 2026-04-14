@@ -16,8 +16,8 @@ from sagemaker_toolbox.utils.env_utils import SAGEMAKER_JOB_ROOT_PATH
 
 # Dataset hash from Abstra
 TCGA_LUAD = "4d2063d1-0d25-43c3-83c3-b006355a3f68"
-MOSAIC_OV = "bd7598aa-05f4-461d-8683-67d3a424118d"
-MOSAIC_BLCA = "dc3510e2-76eb-47f6-9bb4-d20d340ee808"
+MOSAIC_OV = "ff2679f4-71dc-4b49-823f-ba90b1244f8b"
+MOSAIC_BLCA = "c1521eca-c504-4752-8597-bd375b4deaa1"
 
 ROOT_PATH = str(
     SAGEMAKER_JOB_ROOT_PATH
