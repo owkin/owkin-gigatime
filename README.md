@@ -90,11 +90,19 @@ gigatime/                   # main Python package
 │   ├── predict.py          # inference logic (sliding window)
 │   ├── constants.py        # channel names, tile size, normalisation
 │   └── cli.py              # command-line interface
-└── data/
-    ├── s3.py               # S3 slide discovery and download
-    ├── slide.py            # OpenSlide wrapper (auto level selection)
-    ├── tiling.py           # tile iterator and slide-level stitching
-    └── paths.py            # dataset path constants
+├── data/
+│   ├── s3.py               # S3 slide discovery and download
+│   ├── slide.py            # OpenSlide wrapper (auto level selection)
+│   ├── tiling.py           # tile iterator and slide-level stitching
+│   └── paths.py            # dataset path constants
+└── features/
+    ├── compartments.py     # tumour / stroma masks from CK + DAPI
+    ├── coexpression.py     # pixel-level and cell-footprint co-expression
+    ├── density.py          # compartment-normalised density
+    ├── proximity.py        # distance-transform spatial proximity scores
+    ├── tls.py              # tertiary lymphoid structure detection
+    ├── features.py         # assembles all features into a flat dict per slide
+    └── README.md           # feature catalogue with biomedical questions
 notebooks/                  # worked examples
 legacy_gigatime_repo/       # original Microsoft / Providence code (unmodified)
 pyproject.toml              # uv-managed dependencies

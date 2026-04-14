@@ -1,6 +1,10 @@
 """Interactive python script to run inference of gigatime on HE slides."""
 
 # %%
+%load_ext autoreload
+%autoreload 2
+
+# %%
 from pathlib import Path
 
 import matplotlib.pyplot as plt
