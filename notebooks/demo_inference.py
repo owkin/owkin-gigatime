@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides, stitch
 from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_OV, TCGA_LUAD
-from gigatime.inference import load_model, predict_batch
+from gigatime.inference import load_model, predict, predict_batch
 from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -251,16 +251,9 @@ for idx, uri in enumerate(slide_uris_batch):
         print(f"         {w} × {h} px")
 
         with torch.inference_mode():
-            buf: list = []
             for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05):
-                buf.append(tile)
-                if len(buf) == BATCH_SIZE:
-                    predict_batch([t.array for t in buf], model, device=DEVICE)
-                    n_tiles += len(buf)
-                    buf = []
-            if buf:
-                predict_batch([t.array for t in buf], model, device=DEVICE)
-                n_tiles += len(buf)
+                predict(tile.array, model, device=DEVICE)
+                n_tiles += 1
 
         reader.close()
     except Exception as exc:

@@ -16,9 +16,7 @@ from tqdm import tqdm
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import compute_features_from_tiles
-from gigatime.inference import load_model, predict_batch
-
-BATCH_SIZE = 8  # increase if GPU memory allows
+from gigatime.inference import load_model, predict
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
@@ -49,35 +47,22 @@ model.eval()
 reader = SlideReader(slide_uri)
 grid = None
 tile_stream: list = []
-tile_buf: list = []
 future = None
 
 
-def _accumulate(preds_list, tiles):
-    for preds, t in zip(preds_list, tiles):
-        tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
+def _accumulate(preds, tile):
+    tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile))
 
 
 with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
     for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
-        tile_buf.append(tile)
-        if len(tile_buf) < BATCH_SIZE:
-            continue
-
-        # GPU inference for current batch — background thread runs _accumulate
-        # for the previous batch concurrently (GIL released during CUDA ops).
-        preds_list = predict_batch([t.array for t in tile_buf], model, device=DEVICE)
+        # GPU inference — background thread runs _accumulate for the previous
+        # tile concurrently (GIL released during CUDA ops).
+        preds = predict(tile.array, model, device=DEVICE)
 
         if future is not None:
             future.result()
-        future = executor.submit(_accumulate, preds_list, list(tile_buf))
-        tile_buf = []
-
-    if tile_buf:
-        preds_list = predict_batch([t.array for t in tile_buf], model, device=DEVICE)
-        if future is not None:
-            future.result()
-        future = executor.submit(_accumulate, preds_list, list(tile_buf))
+        future = executor.submit(_accumulate, preds, tile)
 
     if future is not None:
         future.result()
