@@ -15,13 +15,13 @@ from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
-from gigatime.features import compute_features_from_tiles
+from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-# Channels required by compute_features_from_tiles — nothing extra.
+# Channels consumed by SlideFeatureAccumulator.
 FEATURE_CHANNELS = [
     "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
     "PD-1", "PD-L1", "Ki67", "Caspase3-D",
@@ -41,23 +41,24 @@ model = load_model(device=DEVICE)
 model.eval()
 
 # %%
-# Batched inference + pipelined feature accumulation:
-#   GPU runs inference on batch N+1 while CPU accumulates features for batch N.
-#   cv2.dilate (used internally) is ~4x faster than scipy binary_dilation.
+# Pipelined inference + feature accumulation:
+#   GPU runs inference on tile N+1 while CPU accumulates features for tile N.
+#   SlideFeatureAccumulator keeps only running integer counters — O(1) memory
+#   regardless of slide size (no tile predictions are buffered).
 reader = SlideReader(slide_uri)
 grid = None
-tile_stream: list = []
+acc: SlideFeatureAccumulator | None = None
 future = None
 
 
 def _accumulate(preds, tile):
-    tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile))
+    acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile)
 
 
 with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
     for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
-        # GPU inference — background thread runs _accumulate for the previous
-        # tile concurrently (GIL released during CUDA ops).
+        if acc is None:
+            acc = SlideFeatureAccumulator(grid)
         preds = predict(tile.array, model, device=DEVICE)
 
         if future is not None:
@@ -69,8 +70,9 @@ with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
 
 reader.close()
 assert grid is not None, "No tissue tiles found"
+assert acc is not None, "No tissue tiles found"
 
-features = compute_features_from_tiles(iter(tile_stream), grid)
+features = acc.finalize()
 
 # %%
 # Display features

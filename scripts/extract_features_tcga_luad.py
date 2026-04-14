@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
-from gigatime.features import compute_features_from_tiles
+from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict
 
 FEATURE_CHANNELS = [
@@ -77,31 +77,34 @@ def _process_slide(
     reader = SlideReader(uri)
     w, h = reader.dimensions_at_read_level
 
-    tile_stream: list = []
     grid = None
+    acc: SlideFeatureAccumulator | None = None
     future = None
+    n_tiles = 0
 
     def _accumulate(preds: dict, tile) -> None:
-        tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile))
+        acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, tile)
 
     t0 = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
         for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05):
+            if acc is None:
+                acc = SlideFeatureAccumulator(grid)
             preds = predict(tile.array, model, device=device)
             if future is not None:
                 future.result()
             future = executor.submit(_accumulate, preds, tile)
+            n_tiles += 1
         if future is not None:
             future.result()
 
     reader.close()
 
-    if grid is None:
+    if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    n_tiles = len(tile_stream)
-    features = compute_features_from_tiles(iter(tile_stream), grid)
+    features = acc.finalize()
     elapsed = time.perf_counter() - t0
 
     return {

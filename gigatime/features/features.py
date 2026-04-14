@@ -1,19 +1,16 @@
 """Top-level feature assembly for one slide.
 
-Two entry points are provided:
+Three entry points are provided:
 
-compute_features_from_tiles  (recommended)
-    Streams over ``(preds, tile)`` pairs produced during inference.
-    All features are computed as running pixel-count sums — no tile
-    predictions are kept in memory.
+SlideFeatureAccumulator  (recommended for large slides)
+    Stateful accumulator with ``update(preds, tile)`` and ``finalize()``
+    methods.  Accumulate pixel counts one tile at a time — no tile
+    predictions are kept in memory.  Use this when inference and feature
+    accumulation run concurrently (e.g. GPU inference + CPU accumulation
+    via ThreadPoolExecutor).
 
-    Memory cost: O(1) beyond the model and one tile at a time.
-    Compare to the naïve approach: N_tiles × 21 × 512² × 4 bytes — typically
-    30–60 GB for a TCGA whole-slide image.
-
-    TLS detection is not included in the streaming path: it requires
-    connected-component analysis across the full slide canvas and should be
-    added once a downsampled-canvas strategy is in place.
+compute_features_from_tiles
+    Convenience wrapper around SlideFeatureAccumulator for iterables.
 
 compute_features
     Accepts a pre-built ``maps`` dict (channel → H×W array).  Useful when
@@ -33,54 +30,49 @@ from .density import density
 from .tls import detect_tls
 
 
-def compute_features_from_tiles(
-    tile_iter: Iterable[tuple[dict[str, np.ndarray], Tile]],
-    grid: TileGrid,
-) -> dict[str, float]:
-    """Compute slide-level features by streaming over per-tile predictions.
+class SlideFeatureAccumulator:
+    """Stateful, O(1)-memory accumulator for slide-level GigaTIME features.
 
-    No tile prediction dicts are retained in memory.  All features are
-    accumulated as integer pixel counts and resolved into scalars at the end.
+    Usage::
 
-    TLS detection is excluded from this path (requires a full slide canvas).
-    Use :func:`compute_features` when maps are already available.
+        acc = SlideFeatureAccumulator(grid)
+        for preds, tile in ...:
+            acc.update(preds, tile)
+        features = acc.finalize()
 
     Args:
-        tile_iter: Iterable of ``(prediction_dict, tile)`` pairs, as produced
-                   by pairing :func:`~gigatime.data.iter_tiles` with
-                   :func:`~gigatime.inference.predict`.
-        grid:      :class:`~gigatime.data.TileGrid` returned by
-                   :func:`~gigatime.data.iter_tiles`.
-
-    Returns:
-        Flat ``dict[str, float]`` of scalar feature values.
+        grid: :class:`~gigatime.data.TileGrid` returned by
+              :func:`~gigatime.data.iter_tiles`.
     """
-    H, W = grid.slide_height, grid.slide_width
-    step = grid.tile_size - grid.overlap
 
-    acc: dict[str, int] = {
-        "ck_dapi": 0,  # tumour pixels (CK & DAPI) — shared denominator
-        "pdl1_ck": 0,
-        "ki67_ck": 0,
-        "casp3_ck": 0,
-        "tumor_px": 0,
-        "stroma_px": 0,
-        "cd8_tumor": 0,
-        "cd8_stroma": 0,
-        "cd8_total": 0,  # CD8 in tissue — exhaustion & macrophage ratio denom
-        "cd8_pd1": 0,
-        "cd68_tissue": 0,
-        "cd4_tumor": 0,
-        "cd34_tumor": 0,
-    }
+    def __init__(self, grid: TileGrid) -> None:
+        self._grid = grid
+        self._acc: dict[str, int] = {
+            "ck_dapi": 0,
+            "pdl1_ck": 0,
+            "ki67_ck": 0,
+            "casp3_ck": 0,
+            "tumor_px": 0,
+            "stroma_px": 0,
+            "cd8_tumor": 0,
+            "cd8_stroma": 0,
+            "cd8_total": 0,
+            "cd8_pd1": 0,
+            "cd68_tissue": 0,
+            "cd4_tumor": 0,
+            "cd34_tumor": 0,
+        }
 
-    for preds, tile in tile_iter:
+    def update(self, preds: dict[str, np.ndarray], tile: Tile) -> None:
+        """Accumulate pixel counts for one tile. Thread-safe for single writer."""
+        grid = self._grid
+        H, W = grid.slide_height, grid.slide_width
+        step = grid.tile_size - grid.overlap
         ts = grid.tile_size
         y0 = tile.row * step
         x0 = tile.col * step
-        y1 = min(y0 + ts, H)
-        x1 = min(x0 + ts, W)
-        th, tw = y1 - y0, x1 - x0
+        th = min(y0 + ts, H) - y0
+        tw = min(x0 + ts, W) - x0
 
         ck = preds["CK"][:th, :tw].astype(bool)
         dapi = preds["DAPI"][:th, :tw].astype(bool)
@@ -95,6 +87,7 @@ def compute_features_from_tiles(
         t_mask = ck & dapi
         s_mask = ~ck & dapi
 
+        acc = self._acc
         acc["ck_dapi"] += int(t_mask.sum())
         acc["pdl1_ck"] += int((pdl1 & ck).sum())
         acc["ki67_ck"] += int((ki67 & ck).sum())
@@ -107,37 +100,59 @@ def compute_features_from_tiles(
         acc["cd68_tissue"] += int((cd68 & dapi).sum())
         acc["cd4_tumor"] += int((cd4 & t_mask).sum())
         acc["cd34_tumor"] += int((cd34 & t_mask).sum())
-
-        # Dilation co-expression is valid per tile: lymphocytes (~16–24 px)
-        # never span tile boundaries (tiles are 512 px).
         acc["cd8_pd1"] += int(
             dilated_overlap(preds["CD8"][:th, :tw], preds["PD-1"][:th, :tw]).sum()
         )
 
-    ck_dapi = acc["ck_dapi"]
-    tumor_px = acc["tumor_px"]
-    stroma_px = acc["stroma_px"]
-    cd8_tumor = acc["cd8_tumor"]
-    cd8_stroma = acc["cd8_stroma"]
+    def finalize(self) -> dict[str, float]:
+        """Resolve accumulated pixel counts into scalar feature values."""
+        acc = self._acc
+        ck_dapi = acc["ck_dapi"]
+        tumor_px = acc["tumor_px"]
+        stroma_px = acc["stroma_px"]
+        cd8_tumor_d = acc["cd8_tumor"] / tumor_px if tumor_px > 0 else 0.0
+        cd8_stroma_d = acc["cd8_stroma"] / stroma_px if stroma_px > 0 else 0.0
 
-    cd8_stroma_d = cd8_stroma / stroma_px if stroma_px > 0 else 0.0
-    cd8_tumor_d = cd8_tumor / tumor_px if tumor_px > 0 else 0.0
+        return {
+            "pdl1_tps": acc["pdl1_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
+            "ki67_tpi": acc["ki67_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
+            "apoptosis_index": acc["casp3_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
+            "cd8_intratumoral_density": cd8_tumor_d,
+            "immune_exclusion_index": cd8_stroma_d / (cd8_stroma_d + cd8_tumor_d + 1e-6),
+            "cd8_pd1_exhaustion_fraction": (
+                acc["cd8_pd1"] / acc["cd8_total"] if acc["cd8_total"] > 0 else 0.0
+            ),
+            "macrophage_to_tcell_ratio": acc["cd68_tissue"] / (acc["cd8_total"] + 1e-6),
+            "cd4_cd8_intratumoral_ratio": (
+                (acc["cd4_tumor"] / tumor_px) / (cd8_tumor_d + 1e-6) if tumor_px > 0 else 0.0
+            ),
+            "vascular_density_intratumoral": (
+                acc["cd34_tumor"] / tumor_px if tumor_px > 0 else 0.0
+            ),
+        }
 
-    return {
-        "pdl1_tps": acc["pdl1_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
-        "ki67_tpi": acc["ki67_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
-        "apoptosis_index": acc["casp3_ck"] / ck_dapi if ck_dapi > 0 else 0.0,
-        "cd8_intratumoral_density": cd8_tumor_d,
-        "immune_exclusion_index": cd8_stroma_d / (cd8_stroma_d + cd8_tumor_d + 1e-6),
-        "cd8_pd1_exhaustion_fraction": (
-            acc["cd8_pd1"] / acc["cd8_total"] if acc["cd8_total"] > 0 else 0.0
-        ),
-        "macrophage_to_tcell_ratio": acc["cd68_tissue"] / (acc["cd8_total"] + 1e-6),
-        "cd4_cd8_intratumoral_ratio": (
-            (acc["cd4_tumor"] / tumor_px) / (cd8_tumor_d + 1e-6) if tumor_px > 0 else 0.0
-        ),
-        "vascular_density_intratumoral": (acc["cd34_tumor"] / tumor_px if tumor_px > 0 else 0.0),
-    }
+
+def compute_features_from_tiles(
+    tile_iter: Iterable[tuple[dict[str, np.ndarray], Tile]],
+    grid: TileGrid,
+) -> dict[str, float]:
+    """Compute slide-level features by streaming over per-tile predictions.
+
+    Thin wrapper around :class:`SlideFeatureAccumulator`.  For concurrent
+    inference + accumulation use :class:`SlideFeatureAccumulator` directly.
+
+    Args:
+        tile_iter: Iterable of ``(prediction_dict, tile)`` pairs.
+        grid:      :class:`~gigatime.data.TileGrid` returned by
+                   :func:`~gigatime.data.iter_tiles`.
+
+    Returns:
+        Flat ``dict[str, float]`` of scalar feature values.
+    """
+    acc = SlideFeatureAccumulator(grid)
+    for preds, tile in tile_iter:
+        acc.update(preds, tile)
+    return acc.finalize()
 
 
 def compute_features(maps: dict[str, np.ndarray]) -> dict[str, float]:
