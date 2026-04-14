@@ -1,4 +1,4 @@
-"""Demo: compute spatial biomarker features from a single LUAD slide."""
+"""Demo: compute and interpret spatial biomarker features for a single LUAD slide."""
 
 # %%
 %load_ext autoreload
@@ -8,24 +8,25 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
-import openslide
 import torch
 from abstra.manifest import Manifest
-from PIL import Image
+from tqdm import tqdm
 
-from gigatime.data import SlideReader, iter_tiles, list_slides, stitch
+from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import compute_features_from_tiles
-from gigatime.features.compartments import stroma_mask, tissue_mask, tumor_mask
-from gigatime.inference import load_model, predict
-from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
+from gigatime.inference import load_model, predict_batch
+
+BATCH_SIZE = 8  # increase if GPU memory allows
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-# Channels to stitch for visualisation — kept small to limit memory use.
-VIZ_CHANNELS = ["CK", "DAPI", "CD8", "PD-L1", "PD-1", "CD68", "CD20", "CD3"]
+# Channels required by compute_features_from_tiles — nothing extra.
+FEATURE_CHANNELS = [
+    "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
+    "PD-1", "PD-L1", "Ki67", "Caspase3-D",
+]
 
 # %%
 # Load model and slide
@@ -41,100 +42,81 @@ model = load_model(device=DEVICE)
 model.eval()
 
 # %%
-# Run inference — stream tiles through feature accumulators and stitch only
-# the channels needed for visualisation.  No tile prediction dicts are kept
-# in memory: see gigatime/features/features.py for the memory analysis.
+# Run batched inference and compute features in a single pass
 reader = SlideReader(slide_uri)
-w, h = reader.dimensions_at_read_level
-print(f"Slide at read level: {w} × {h} px")
-
-viz_maps: dict[str, np.ndarray] = {ch: np.zeros((h, w), dtype=np.float32) for ch in VIZ_CHANNELS}
-tile_results_for_viz: list[tuple[dict[str, np.ndarray], object]] = []
 grid = None
-n_tiles = 0
+tile_stream = []
+
+tile_buf: list = []
+grid_buf = None
 
 with torch.inference_mode():
-    for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05):
-        preds = predict(tile.array, model, device=DEVICE)
-        # Accumulate only the viz channels — discard everything else immediately
-        tile_results_for_viz.append(({ch: preds[ch] for ch in VIZ_CHANNELS}, tile))
-        n_tiles += 1
-        if n_tiles % 20 == 0:
-            print(f"  {n_tiles} tiles done…")
+    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
+        tile_buf.append(tile)
+        grid_buf = grid
+        if len(tile_buf) < BATCH_SIZE:
+            continue
+        for preds, t in zip(
+            predict_batch([t.array for t in tile_buf], model, device=DEVICE), tile_buf
+        ):
+            tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
+        tile_buf = []
+
+    # flush remaining tiles
+    if tile_buf:
+        for preds, t in zip(
+            predict_batch([t.array for t in tile_buf], model, device=DEVICE), tile_buf
+        ):
+            tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
 
 reader.close()
 assert grid is not None, "No tissue tiles found"
-print(f"Done: {n_tiles} tiles across a {grid.n_rows}×{grid.n_cols} grid")
+
+features = compute_features_from_tiles(iter(tile_stream), grid)
 
 # %%
-# Compute features with the streaming path (re-uses the slim viz tile list)
-features = compute_features_from_tiles(
-    # Reconstruct full preds on the fly by re-running predict would be ideal;
-    # here we reuse the stored viz subset — sufficient for all current features.
-    ((preds, tile) for preds, tile in tile_results_for_viz),
-    grid,
-)
-
-print(f"\nFeatures for {Path(slide_uri).name}:\n")
-for name, value in features.items():
-    bar = "█" * int(min(value, 1.0) * 30)
-    print(f"  {name:<35s} {value:.4f}  {bar}")
-
-# %%
-# Stitch the viz channels
-print("\nStitching visualisation maps…")
-maps: dict[str, np.ndarray] = {
-    ch: stitch(tile_results_for_viz, grid, channel=ch, mode="max") for ch in VIZ_CHANNELS
+# Display features
+FEATURE_LABELS = {
+    "pdl1_tps":                   "PD-L1 TPS",
+    "cd8_intratumoral_density":   "CD8 intratumoral density",
+    "immune_exclusion_index":     "Immune exclusion index",
+    "cd8_pd1_exhaustion_fraction":"CD8+PD-1 exhaustion fraction",
+    "macrophage_to_tcell_ratio":  "Macrophage / T-cell ratio",
+    "cd4_cd8_intratumoral_ratio": "CD4 / CD8 intratumoral ratio",
+    "ki67_tpi":                   "Ki67 tumour proliferation index",
+    "apoptosis_index":            "Tumour apoptosis index",
+    "vascular_density_intratumoral": "Intratumoural vascular density (CD34)",
 }
 
-# %%
-# Visualise compartment masks alongside H&E
-ck = maps["CK"]
-dapi = maps["DAPI"]
+labels = [FEATURE_LABELS.get(k, k) for k in features]
+values = list(features.values())
 
-t_mask = tumor_mask(ck, dapi)
-s_mask = stroma_mask(ck, dapi)
-ti_mask = tissue_mask(dapi)
-
-raw_slide = openslide.OpenSlide(str(reader.path))
-thumb_w, thumb_h = 512, 512
-thumbnail = np.array(raw_slide.get_thumbnail((thumb_w, thumb_h)).convert("RGB"))
-raw_slide.close()
-
-
-def _thumb(mask: np.ndarray) -> np.ndarray:
-    """Downsample a boolean mask to thumbnail size for display."""
-    return np.array(
-        Image.fromarray(mask.astype(np.uint8) * 255).resize(
-            (thumb_w, thumb_h), Image.NEAREST
-        )
-    )
-
-
-fig, axes = plt.subplots(1, 4, figsize=(18, 5))
-axes[0].imshow(thumbnail)
-axes[0].set_title("H&E", fontweight="bold")
-axes[1].imshow(_thumb(ti_mask), cmap="gray")
-axes[1].set_title("Tissue (DAPI)")
-axes[2].imshow(_thumb(t_mask), cmap="Reds")
-axes[2].set_title("Tumour (CK+)")
-axes[3].imshow(_thumb(s_mask), cmap="Blues")
-axes[3].set_title("Stroma (CK−)")
-for ax in axes:
-    ax.axis("off")
-fig.suptitle(f"Compartment masks — {Path(slide_uri).name}", fontsize=13)
+fig, ax = plt.subplots(figsize=(8, 5))
+bars = ax.barh(labels, values, color="steelblue")
+ax.bar_label(bars, fmt="{:.3f}", padding=4, fontsize=9)
+ax.set_xlim(0, max(values) * 1.25)
+ax.set_xlabel("Feature value")
+ax.invert_yaxis()
+ax.set_title(f"Spatial biomarker features\n{Path(slide_uri).name}", fontsize=11)
 plt.tight_layout()
 plt.show()
 
 # %%
-# Visualise the key immune channels
-IMMUNE_CHANNELS = ["CD8", "PD-L1", "PD-1", "CD68", "CD20", "CD3"]
+# Derive TME class from the three key axes
+pdl1 = features["pdl1_tps"]
+cd8 = features["cd8_intratumoral_density"]
+excl = features["immune_exclusion_index"]
 
-fig, axes = plt.subplots(1, len(IMMUNE_CHANNELS), figsize=(4 * len(IMMUNE_CHANNELS), 4))
-for ax, ch in zip(axes, IMMUNE_CHANNELS):
-    ax.imshow(_thumb(maps[ch].astype(bool)), cmap="hot")
-    ax.set_title(ch)
-    ax.axis("off")
-fig.suptitle("Key immune channels", fontsize=13)
-plt.tight_layout()
-plt.show()
+if cd8 > 0.05 and pdl1 > 0.01:
+    tme_class = "Inflamed (hot)"
+elif excl > 0.6:
+    tme_class = "Excluded"
+elif cd8 < 0.02:
+    tme_class = "Desert (cold)"
+else:
+    tme_class = "Intermediate"
+
+print(f"TME class : {tme_class}")
+print(f"PD-L1 TPS : {pdl1:.3f}  ({'≥1%' if pdl1 >= 0.01 else '<1%'} pembrolizumab threshold)")
+print(f"CD8 intra : {cd8:.3f}")
+print(f"Exclusion : {excl:.3f}")

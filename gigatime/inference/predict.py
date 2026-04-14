@@ -13,6 +13,8 @@ from .constants import (
     INFERENCE_WINDOW_SIZE,
 )
 
+_N_CLASSES = len(CHANNEL_NAMES)
+
 
 def predict(
     image: np.ndarray,
@@ -62,6 +64,50 @@ def predict(
     return result
 
 
+def predict_batch(
+    images: list[np.ndarray],
+    model: nn.Module,
+    device: str | torch.device = "cpu",
+    threshold: float = 0.5,
+    window_size: int = INFERENCE_WINDOW_SIZE,
+    overlap: int = 0,
+) -> list[dict[str, np.ndarray]]:
+    """Run GigaTIME on a batch of H&E tiles in a single forward pass.
+
+    All sliding-window crops from every tile in the batch are stacked and
+    processed together, maximising GPU utilisation compared to calling
+    :func:`predict` repeatedly.
+
+    Args:
+        images:      List of B uint8 RGB arrays, each of shape (H, W, 3).
+                     All images must have the same spatial dimensions.
+        model:       GigaTIME model returned by ``load_model()``.
+        device:      Torch device to run inference on.
+        threshold:   Probability threshold for binary predictions.
+        window_size: Sliding window size in pixels.
+        overlap:     Overlap between adjacent windows in pixels.
+
+    Returns:
+        List of B dicts, each mapping channel name → (H, W) float32 mask.
+    """
+    if overlap >= window_size:
+        raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
+
+    B = len(images)
+    # (B, 3, H, W)
+    batch = torch.cat([_preprocess(img, device) for img in images])
+    probs = _sliding_window_inference_batch(batch, model, window_size, overlap)  # (B, C, H, W)
+    probs_np = probs.permute(0, 2, 3, 1).cpu().numpy()  # (B, H, W, C)
+
+    return [
+        {
+            name: (probs_np[b, ..., i] >= threshold).astype(np.float32)
+            for i, name in enumerate(CHANNEL_NAMES)
+        }
+        for b in range(B)
+    ]
+
+
 def predict_from_path(
     image_path: str | Path,
     model: nn.Module,
@@ -109,24 +155,48 @@ def _sliding_window_inference(
     overlap: int,
 ) -> torch.Tensor:
     """Return sigmoid probabilities (1, C, H, W) using a sliding window."""
-    _, _, h, w = x.shape
-    num_classes = len(CHANNEL_NAMES)
+    return _sliding_window_inference_batch(x, model, window_size, overlap)
+
+
+def _sliding_window_inference_batch(
+    x: torch.Tensor,
+    model: nn.Module,
+    window_size: int,
+    overlap: int,
+) -> torch.Tensor:
+    """Return sigmoid probabilities (B, C, H, W) for a batch of tiles.
+
+    All sliding-window crops across all B tiles are stacked into a single
+    tensor and processed in one model call, maximising GPU utilisation.
+    """
+    B, _, h, w = x.shape
     step = window_size - overlap
 
-    accumulator = torch.zeros(1, num_classes, h, w, device=x.device)
-    count_map = torch.zeros(1, 1, h, w, device=x.device)
+    # Collect all (i_start, i_end, j_start, j_end) positions once
+    positions: list[tuple[int, int, int, int]] = []
+    for i in range(0, h, step):
+        for j in range(0, w, step):
+            i_end = min(i + window_size, h)
+            j_end = min(j + window_size, w)
+            positions.append((i_end - window_size, i_end, j_end - window_size, j_end))
+
+    n_windows = len(positions)
+
+    # Stack all crops: (n_windows * B, 3, window_size, window_size)
+    crops = torch.stack([x[:, :, r0:r1, c0:c1] for r0, r1, c0, c1 in positions], dim=1).reshape(
+        n_windows * B, x.shape[1], window_size, window_size
+    )
 
     with torch.no_grad():
-        for i in range(0, h, step):
-            for j in range(0, w, step):
-                i_end = min(i + window_size, h)
-                j_end = min(j + window_size, w)
-                i_start = i_end - window_size
-                j_start = j_end - window_size
+        logits = model(crops)  # (n_windows * B, C, window_size, window_size)
 
-                window = x[:, :, i_start:i_end, j_start:j_end]
-                logits = model(window)
-                accumulator[:, :, i_start:i_end, j_start:j_end] += torch.sigmoid(logits)
-                count_map[:, :, i_start:i_end, j_start:j_end] += 1
+    probs = torch.sigmoid(logits).reshape(n_windows, B, _N_CLASSES, window_size, window_size)
+
+    accumulator = torch.zeros(B, _N_CLASSES, h, w, device=x.device)
+    count_map = torch.zeros(B, 1, h, w, device=x.device)
+
+    for k, (r0, r1, c0, c1) in enumerate(positions):
+        accumulator[:, :, r0:r1, c0:c1] += probs[k]
+        count_map[:, :, r0:r1, c0:c1] += 1
 
     return accumulator / count_map
