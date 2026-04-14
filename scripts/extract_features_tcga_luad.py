@@ -156,7 +156,7 @@ def main() -> None:
     # ---- Discover slides ----
     manifest = Manifest().load()
     dataset = manifest.datasets[TCGA_LUAD]
-    all_slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+    all_slides = [s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s]
     if args.limit is not None:
         all_slides = all_slides[: args.limit]
 

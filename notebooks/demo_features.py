@@ -31,7 +31,7 @@ FEATURE_CHANNELS = [
 # Load model and slide
 manifest = Manifest().load()
 dataset = manifest.datasets[TCGA_LUAD]
-slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+slides = [s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s]
 
 SLIDE_INDEX = 0
 slide_uri = slides[SLIDE_INDEX]

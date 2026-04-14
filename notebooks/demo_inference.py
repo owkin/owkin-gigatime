@@ -39,6 +39,8 @@ DATASET = AVAILABLE_DATASETS[1]  # change key to switch datasets
 manifest = Manifest().load()
 dataset = manifest.datasets[DATASET]
 slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+if DATASET == TCGA_LUAD:
+    slides = [s for s in slides if "parafine" in s]
 
 print(f"Found {len(slides)} slides in {dataset.name}")
 for i, uri in enumerate(slides[:10]):
