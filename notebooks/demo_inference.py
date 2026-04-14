@@ -14,13 +14,22 @@ import torch
 from abstra.manifest import Manifest
 from PIL import Image
 
+from tqdm import tqdm
+
 from gigatime.data import SlideReader, iter_tiles, list_slides, stitch
 from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_OV, TCGA_LUAD
-from gigatime.inference import load_model, predict
-from gigatime.inference.constants import CHANNEL_NAMES
+from gigatime.inference import load_model, predict_batch
+from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
+
+BATCH_SIZE = 8  # increase if GPU memory allows
+CHANNELS_TO_DISPLAY = ["CD8", "CD3", "PD-1", "PD-L1", "CK", "CD4"]
+ANALYSIS_CHANNELS = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
+N_SAMPLE_TILES = 3
+CANVAS_MAX_DIM = 2048   # downsampled canvas for display
+ALL_CANVAS_MAX_DIM = 1024
 
 # %%
 # --- Choose dataset ---
@@ -60,55 +69,69 @@ n_tiles = 0
 vis_scale = 1.0
 all_scale = 1.0
 
+def _process_tile(tile, preds, grid, step):
+    """Update canvases, stats and reservoir sample for one tile."""
+    for ch in CHANNEL_NAMES:
+        sums[ch] += float(preds[ch].sum())
+        pixel_counts[ch] += preds[ch].size
+
+    y0_full = tile.row * step
+    x0_full = tile.col * step
+    y1_full = min(y0_full + grid.tile_size, grid.slide_height)
+    x1_full = min(x0_full + grid.tile_size, grid.slide_width)
+    for canvas_dict, s in ((vis_canvas, vis_scale), (all_canvas, all_scale)):
+        y0_c, x0_c = int(y0_full * s), int(x0_full * s)
+        y1_c, x1_c = int(y1_full * s), int(x1_full * s)
+        if y1_c > y0_c and x1_c > x0_c:
+            for ch in canvas_dict:
+                patch = np.array(
+                    Image.fromarray((preds[ch] * 255).astype(np.uint8)).resize(
+                        (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
+                    )
+                ) / 255.0
+                canvas_dict[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
+                    canvas_dict[ch][y0_c:y1_c, x0_c:x1_c], patch
+                )
+
+    global n_tiles
+    tile_data = (tile.array.copy(), {ch: preds[ch] for ch in CHANNELS_TO_DISPLAY})
+    if n_tiles < N_SAMPLE_TILES:
+        sampled_tiles.append(tile_data)
+    else:
+        j = np.random.randint(0, n_tiles + 1)
+        if j < N_SAMPLE_TILES:
+            sampled_tiles[j] = tile_data
+    n_tiles += 1
+
+
+tile_buf: list = []
+
 with torch.inference_mode():
-    for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05, progress=True):
+    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
         if not vis_canvas:
             step = grid.tile_size - grid.overlap
             vis_scale = CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
             all_scale = ALL_CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
-            vis_canvas = {
+            vis_canvas.update({
                 ch: np.zeros((max(1, int(grid.slide_height * vis_scale)), max(1, int(grid.slide_width * vis_scale))), dtype=np.float32)
                 for ch in CHANNELS_TO_DISPLAY
-            }
-            all_canvas = {
+            })
+            all_canvas.update({
                 ch: np.zeros((max(1, int(grid.slide_height * all_scale)), max(1, int(grid.slide_width * all_scale))), dtype=np.float32)
                 for ch in ANALYSIS_CHANNELS
-            }
-        preds = predict(tile.array, model, device=DEVICE)
+            })
 
-        # Running sums for statistics (all channels, no spatial storage)
-        for ch in CHANNEL_NAMES:
-            sums[ch] += float(preds[ch].sum())
-            pixel_counts[ch] += preds[ch].size
+        tile_buf.append(tile)
+        if len(tile_buf) < BATCH_SIZE:
+            continue
 
-        # Update both downsampled canvases
-        y0_full = tile.row * step
-        x0_full = tile.col * step
-        y1_full = min(y0_full + grid.tile_size, grid.slide_height)
-        x1_full = min(x0_full + grid.tile_size, grid.slide_width)
-        for canvas_dict, s in ((vis_canvas, vis_scale), (all_canvas, all_scale)):
-            y0_c, x0_c = int(y0_full * s), int(x0_full * s)
-            y1_c, x1_c = int(y1_full * s), int(x1_full * s)
-            if y1_c > y0_c and x1_c > x0_c:
-                for ch in canvas_dict:
-                    patch = np.array(
-                        Image.fromarray((preds[ch] * 255).astype(np.uint8)).resize(
-                            (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
-                        )
-                    ) / 255.0
-                    canvas_dict[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
-                        canvas_dict[ch][y0_c:y1_c, x0_c:x1_c], patch
-                    )
+        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE)):
+            _process_tile(t, preds, grid, step)
+        tile_buf = []
 
-        # Reservoir sampling for full-res tile examples
-        tile_data = (tile.array.copy(), {ch: preds[ch] for ch in CHANNELS_TO_DISPLAY})
-        if n_tiles < N_SAMPLE_TILES:
-            sampled_tiles.append(tile_data)
-        else:
-            j = np.random.randint(0, n_tiles + 1)
-            if j < N_SAMPLE_TILES:
-                sampled_tiles[j] = tile_data
-        n_tiles += 1
+    if tile_buf:
+        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE)):
+            _process_tile(t, preds, grid, step)
 
 reader.close()
 assert grid is not None, "No tissue tiles found — check min_tissue_fraction or slide content"
@@ -197,7 +220,7 @@ for i, ch in enumerate(ANALYSIS_CHANNELS):
     axes[i].axis("off")
 for ax in axes[n_ch:]:
     ax.set_visible(False)
-fig.suptitle(f"Slide-level predictions — all channels\n{Path(slide_path).name}", fontsize=12)
+fig.suptitle(f"Slide-level predictions — all channels\n{Path(slide_uri).name}", fontsize=12)
 plt.tight_layout()
 plt.show()
 
@@ -228,9 +251,16 @@ for idx, uri in enumerate(slide_uris_batch):
         print(f"         {w} × {h} px")
 
         with torch.inference_mode():
+            buf: list = []
             for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05):
-                predict(tile.array, model, device=DEVICE)
-                n_tiles += 1
+                buf.append(tile)
+                if len(buf) == BATCH_SIZE:
+                    predict_batch([t.array for t in buf], model, device=DEVICE)
+                    n_tiles += len(buf)
+                    buf = []
+            if buf:
+                predict_batch([t.array for t in buf], model, device=DEVICE)
+                n_tiles += len(buf)
 
         reader.close()
     except Exception as exc:

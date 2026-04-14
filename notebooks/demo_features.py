@@ -5,6 +5,7 @@
 %autoreload 2
 
 # %%
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -42,32 +43,44 @@ model = load_model(device=DEVICE)
 model.eval()
 
 # %%
-# Run batched inference and compute features in a single pass
+# Batched inference + pipelined feature accumulation:
+#   GPU runs inference on batch N+1 while CPU accumulates features for batch N.
+#   cv2.dilate (used internally) is ~4x faster than scipy binary_dilation.
 reader = SlideReader(slide_uri)
 grid = None
-tile_stream = []
-
+tile_stream: list = []
 tile_buf: list = []
-grid_buf = None
+future = None
 
-with torch.inference_mode():
+
+def _accumulate(preds_list, tiles):
+    for preds, t in zip(preds_list, tiles):
+        tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
+
+
+with ThreadPoolExecutor(max_workers=1) as executor, torch.inference_mode():
     for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference"):
         tile_buf.append(tile)
-        grid_buf = grid
         if len(tile_buf) < BATCH_SIZE:
             continue
-        for preds, t in zip(
-            predict_batch([t.array for t in tile_buf], model, device=DEVICE), tile_buf
-        ):
-            tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
+
+        # GPU inference for current batch — background thread runs _accumulate
+        # for the previous batch concurrently (GIL released during CUDA ops).
+        preds_list = predict_batch([t.array for t in tile_buf], model, device=DEVICE)
+
+        if future is not None:
+            future.result()
+        future = executor.submit(_accumulate, preds_list, list(tile_buf))
         tile_buf = []
 
-    # flush remaining tiles
     if tile_buf:
-        for preds, t in zip(
-            predict_batch([t.array for t in tile_buf], model, device=DEVICE), tile_buf
-        ):
-            tile_stream.append(({ch: preds[ch] for ch in FEATURE_CHANNELS}, t))
+        preds_list = predict_batch([t.array for t in tile_buf], model, device=DEVICE)
+        if future is not None:
+            future.result()
+        future = executor.submit(_accumulate, preds_list, list(tile_buf))
+
+    if future is not None:
+        future.result()
 
 reader.close()
 assert grid is not None, "No tissue tiles found"
