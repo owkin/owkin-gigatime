@@ -96,6 +96,12 @@ FEATURE_CHANNELS = [
     "PD-1", "PD-L1", "Ki67", "Caspase3-D",
 ]
 
+# Intermediate canvas resolution for artifact-free downsampling.
+# Tiles are placed at this resolution; a single BOX downsample to the final
+# map_size then averages across tile boundaries, eliminating the moiré that
+# appears when each tile is resized independently to the small final canvas.
+CANVAS_INTERMEDIATE_SIZE = 4096
+
 
 # ---------------------------------------------------------------------------
 # Tile prefetch helper
@@ -151,11 +157,15 @@ def _process_slide(
     ch_sums: dict[str, int] = {ch: 0 for ch in ANALYSIS_CHANNELS}
     tissue_px: int = 0
 
-    # Downsampled canvas for PNG maps — initialised on first tile.
-    canvas: dict[str, np.ndarray] = {}
-    scale: float = 1.0
-    canvas_h: int = 1
-    canvas_w: int = 1
+    # Intermediate canvas for PNG maps — built at CANVAS_INTERMEDIATE_SIZE,
+    # then BOX-downsampled once to map_size.  Building at a higher intermediate
+    # resolution means the final global BOX downsample averages across many tile
+    # widths, eliminating the moiré that arises when each tile is resized
+    # independently to the small final canvas.
+    canvas_int: dict[str, np.ndarray] = {}
+    scale_int: float = 1.0
+    canvas_h_int: int = 1
+    canvas_w_int: int = 1
 
     t0 = time.perf_counter()
 
@@ -164,8 +174,10 @@ def _process_slide(
         step = grid.tile_size - grid.overlap
         y0 = tile.row * step
         x0 = tile.col * step
-        th = min(y0 + grid.tile_size, grid.slide_height) - y0
-        tw = min(x0 + grid.tile_size, grid.slide_width) - x0
+        y1 = min(y0 + grid.tile_size, grid.slide_height)
+        x1 = min(x0 + grid.tile_size, grid.slide_width)
+        th = y1 - y0
+        tw = x1 - x0
 
         # Running sums: positive pixels normalised by DAPI+ tissue.
         dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
@@ -173,15 +185,12 @@ def _process_slide(
         for ch in ANALYSIS_CHANNELS:
             ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
 
-        # Canvas update — area-average into the downsampled grid.
-        # Using round() for end coords avoids 1-px gaps from floor rounding.
-        # Using Image.BOX (area averaging) instead of NEAREST eliminates the
-        # moiré pattern that NEAREST causes by sampling at fixed strides on
-        # binary predictions.
-        y0_c = int(y0 * scale)
-        x0_c = int(x0 * scale)
-        y1_c = round(min(y0 + grid.tile_size, grid.slide_height) * scale)
-        x1_c = round(min(x0 + grid.tile_size, grid.slide_width) * scale)
+        # Place tile onto intermediate canvas using round() for both endpoints
+        # so adjacent tiles abut perfectly with no 1-pixel gaps.
+        y0_c = round(y0 * scale_int)
+        x0_c = round(x0 * scale_int)
+        y1_c = round(y1 * scale_int)
+        x1_c = round(x1 * scale_int)
         if y1_c > y0_c and x1_c > x0_c:
             target_h, target_w = y1_c - y0_c, x1_c - x0_c
             for ch in ANALYSIS_CHANNELS:
@@ -190,17 +199,20 @@ def _process_slide(
                         (target_w, target_h), Image.BOX
                     )
                 ) / 255.0
-                canvas[ch][y0_c:y1_c, x0_c:x1_c] = patch
+                canvas_int[ch][y0_c:y1_c, x0_c:x1_c] = patch
 
     with torch.inference_mode():
         for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
             if acc is None:
                 acc = SlideFeatureAccumulator(grid)
-                scale = map_size / max(grid.slide_width, grid.slide_height)
-                canvas_h = max(1, int(grid.slide_height * scale))
-                canvas_w = max(1, int(grid.slide_width * scale))
-                canvas.update({
-                    ch: np.zeros((canvas_h, canvas_w), dtype=np.float32)
+                # Intermediate scale — at least as large as map_size so the
+                # final BOX downsample always reduces (never upscales).
+                slide_max = max(grid.slide_width, grid.slide_height)
+                scale_int = max(CANVAS_INTERMEDIATE_SIZE, map_size) / slide_max
+                canvas_h_int = max(1, round(grid.slide_height * scale_int))
+                canvas_w_int = max(1, round(grid.slide_width * scale_int))
+                canvas_int.update({
+                    ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.float32)
                     for ch in ANALYSIS_CHANNELS
                 })
             buf.append(tile)
@@ -222,17 +234,33 @@ def _process_slide(
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    # Save PNG maps with per-channel mIF colors.
-    # A small Gaussian blur removes the 256px window-boundary seam pattern
-    # that appears in the canvas without affecting spatial feature values
-    # (those are computed from raw binary predictions, not the canvas).
+    # Downsample intermediate canvas → final map_size using a global BOX filter,
+    # which averages across tile boundaries and eliminates the moiré.
+    # A small adaptive Gaussian blur is applied to the final image to smooth any
+    # residual seam artifacts from the model's internal inference window (256px).
+    slide_max = max(grid.slide_width, grid.slide_height)
+    scale_final = map_size / slide_max
+    canvas_h_final = max(1, round(grid.slide_height * scale_final))
+    canvas_w_final = max(1, round(grid.slide_width * scale_final))
+    # Blur radius proportional to tile footprint in the final canvas so seams
+    # between inference windows (256px) are blended regardless of slide size.
+    tile_px_in_canvas = max(1, round(512 * scale_final))
+    blur_radius = max(2, tile_px_in_canvas // 2)
+
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
-        arr = canvas[ch]  # float32 [0, 1]
-        blurred = Image.fromarray((arr * 255).astype(np.uint8)).filter(
-            ImageFilter.GaussianBlur(radius=1)
-        )
-        arr_b = np.array(blurred) / 255.0
+        # Global BOX downsample: intermediate → final
+        arr = np.array(
+            Image.fromarray((canvas_int[ch] * 255).astype(np.uint8)).resize(
+                (canvas_w_final, canvas_h_final), Image.BOX
+            )
+        ) / 255.0
+        # Adaptive Gaussian blur to smooth residual tile-boundary seams
+        arr_b = np.array(
+            Image.fromarray((arr * 255).astype(np.uint8)).filter(
+                ImageFilter.GaussianBlur(radius=blur_radius)
+            )
+        ) / 255.0
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
         rgb = np.stack([
             (arr_b * r).astype(np.uint8),
