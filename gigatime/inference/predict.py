@@ -71,6 +71,7 @@ def predict_batch(
     threshold: float = 0.5,
     window_size: int = INFERENCE_WINDOW_SIZE,
     overlap: int = 0,
+    return_probabilities: bool = False,
 ) -> list[dict[str, np.ndarray]]:
     """Run GigaTIME on a batch of H&E tiles in a single forward pass.
 
@@ -79,16 +80,20 @@ def predict_batch(
     :func:`predict` repeatedly.
 
     Args:
-        images:      List of B uint8 RGB arrays, each of shape (H, W, 3).
-                     All images must have the same spatial dimensions.
-        model:       GigaTIME model returned by ``load_model()``.
-        device:      Torch device to run inference on.
-        threshold:   Probability threshold for binary predictions.
-        window_size: Sliding window size in pixels.
-        overlap:     Overlap between adjacent windows in pixels.
+        images:               List of B uint8 RGB arrays, each of shape (H, W, 3).
+                              All images must have the same spatial dimensions.
+        model:                GigaTIME model returned by ``load_model()``.
+        device:               Torch device to run inference on.
+        threshold:            Probability threshold for binary predictions.
+        window_size:          Sliding window size in pixels.
+        overlap:              Overlap between adjacent windows in pixels.
+        return_probabilities: If ``True``, each result dict also contains a
+                              ``"probabilities"`` key with the raw (H, W, C)
+                              float32 sigmoid array before thresholding.
 
     Returns:
         List of B dicts, each mapping channel name → (H, W) float32 mask.
+        If ``return_probabilities=True``, each dict also has ``"probabilities"``.
     """
     if overlap >= window_size:
         raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
@@ -99,13 +104,16 @@ def predict_batch(
     probs = _sliding_window_inference_batch(batch, model, window_size, overlap)  # (B, C, H, W)
     probs_np = probs.permute(0, 2, 3, 1).cpu().numpy()  # (B, H, W, C)
 
-    return [
-        {
+    results = []
+    for b in range(B):
+        d = {
             name: (probs_np[b, ..., i] >= threshold).astype(np.float32)
             for i, name in enumerate(CHANNEL_NAMES)
         }
-        for b in range(B)
-    ]
+        if return_probabilities:
+            d["probabilities"] = probs_np[b]  # (H, W, C)
+        results.append(d)
+    return results
 
 
 def predict_from_path(

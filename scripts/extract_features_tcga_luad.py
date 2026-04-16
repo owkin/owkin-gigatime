@@ -61,7 +61,7 @@ from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict_batch
-from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
+from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES, INFERENCE_WINDOW_SIZE
 
 ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 
@@ -157,15 +157,22 @@ def _process_slide(
     ch_sums: dict[str, int] = {ch: 0 for ch in ANALYSIS_CHANNELS}
     tissue_px: int = 0
 
-    # Intermediate canvas for PNG maps — built at CANVAS_INTERMEDIATE_SIZE,
-    # then BOX-downsampled once to map_size.  Building at a higher intermediate
-    # resolution means the final global BOX downsample averages across many tile
-    # widths, eliminating the moiré that arises when each tile is resized
-    # independently to the small final canvas.
+    # Intermediate canvas for PNG maps.
+    # Tiles are placed at CANVAS_INTERMEDIATE_SIZE resolution using raw model
+    # probabilities (continuous [0,1] — much smoother than binary {0,1} masks).
+    # A single global BOX downsample to map_size then averages across tile
+    # boundaries, and a final Gaussian blur sized to the inference-window
+    # footprint blends the residual 256px seam artifacts.
     canvas_int: dict[str, np.ndarray] = {}
     scale_int: float = 1.0
     canvas_h_int: int = 1
     canvas_w_int: int = 1
+
+    # read_downsample != 1 when the slide MPP doesn't exactly match the target
+    # (e.g. 40x slides at 0.25 µm/px).  In that case iter_tiles downscales each
+    # tile before padding it to tile_size, so only the first
+    # round(tile_size / rd) pixels in each axis contain valid slide content.
+    rd = reader.read_downsample
 
     t0 = time.perf_counter()
 
@@ -178,15 +185,21 @@ def _process_slide(
         x1 = min(x0 + grid.tile_size, grid.slide_width)
         th = y1 - y0
         tw = x1 - x0
+        # Crop to the valid prediction region: when rd != 1 the tile was
+        # resized before padding, so predictions beyond valid_th/valid_tw
+        # correspond to white padding rather than real slide content.
+        valid_th = min(round(th / rd), grid.tile_size)
+        valid_tw = min(round(tw / rd), grid.tile_size)
 
-        # Running sums: positive pixels normalised by DAPI+ tissue.
-        dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
+        # Running sums: positive pixels normalised by DAPI+ tissue (binary).
+        dapi_mask = preds["DAPI"][:valid_th, :valid_tw].astype(bool)
         tissue_px += int(dapi_mask.sum())
         for ch in ANALYSIS_CHANNELS:
-            ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
+            ch_sums[ch] += int((preds[ch][:valid_th, :valid_tw].astype(bool) & dapi_mask).sum())
 
-        # Place tile onto intermediate canvas using round() for both endpoints
-        # so adjacent tiles abut perfectly with no 1-pixel gaps.
+        # Canvas update: use raw probabilities, crop to valid region.
+        # round() for both endpoints so adjacent tiles abut with no pixel gaps.
+        probs = preds["probabilities"]  # (H, W, C) float32
         y0_c = round(y0 * scale_int)
         x0_c = round(x0 * scale_int)
         y1_c = round(y1 * scale_int)
@@ -194,8 +207,10 @@ def _process_slide(
         if y1_c > y0_c and x1_c > x0_c:
             target_h, target_w = y1_c - y0_c, x1_c - x0_c
             for ch in ANALYSIS_CHANNELS:
+                ch_idx = CHANNEL_NAMES.index(ch)
+                prob_patch = probs[:valid_th, :valid_tw, ch_idx]
                 patch = np.array(
-                    Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
+                    Image.fromarray((prob_patch * 255).astype(np.uint8)).resize(
                         (target_w, target_h), Image.BOX
                     )
                 ) / 255.0
@@ -205,8 +220,6 @@ def _process_slide(
         for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
             if acc is None:
                 acc = SlideFeatureAccumulator(grid)
-                # Intermediate scale — at least as large as map_size so the
-                # final BOX downsample always reduces (never upscales).
                 slide_max = max(grid.slide_width, grid.slide_height)
                 scale_int = max(CANVAS_INTERMEDIATE_SIZE, map_size) / slide_max
                 canvas_h_int = max(1, round(grid.slide_height * scale_int))
@@ -219,13 +232,21 @@ def _process_slide(
             n_tiles += 1
             if len(buf) < batch_size:
                 continue
-            for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+            batch_preds = predict_batch(
+                [t.array for t in buf], model, device=device,
+                return_probabilities=True, overlap=64,
+            )
+            for t, preds in zip(buf, batch_preds):
                 acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                 _update(preds, t)
             buf.clear()
 
         if buf:
-            for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+            batch_preds = predict_batch(
+                [t.array for t in buf], model, device=device,
+                return_probabilities=True, overlap=64,
+            )
+            for t, preds in zip(buf, batch_preds):
                 acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                 _update(preds, t)
 
@@ -234,18 +255,15 @@ def _process_slide(
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    # Downsample intermediate canvas → final map_size using a global BOX filter,
-    # which averages across tile boundaries and eliminates the moiré.
-    # A small adaptive Gaussian blur is applied to the final image to smooth any
-    # residual seam artifacts from the model's internal inference window (256px).
+    # Downsample intermediate canvas → final map_size with a global BOX filter,
+    # then apply a Gaussian blur sized to the inference-window footprint so that
+    # seams between adjacent 256px windows are blended in the final image.
     slide_max = max(grid.slide_width, grid.slide_height)
     scale_final = map_size / slide_max
     canvas_h_final = max(1, round(grid.slide_height * scale_final))
     canvas_w_final = max(1, round(grid.slide_width * scale_final))
-    # Blur radius proportional to tile footprint in the final canvas so seams
-    # between inference windows (256px) are blended regardless of slide size.
-    tile_px_in_canvas = max(1, round(512 * scale_final))
-    blur_radius = max(2, tile_px_in_canvas // 2)
+    window_px_in_canvas = max(1, round(INFERENCE_WINDOW_SIZE * scale_final))
+    blur_radius = max(2, window_px_in_canvas // 2)
 
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
@@ -255,17 +273,17 @@ def _process_slide(
                 (canvas_w_final, canvas_h_final), Image.BOX
             )
         ) / 255.0
-        # Adaptive Gaussian blur to smooth residual tile-boundary seams
-        arr_b = np.array(
+        # Gaussian blur to smooth residual inference-window boundary seams
+        arr = np.array(
             Image.fromarray((arr * 255).astype(np.uint8)).filter(
                 ImageFilter.GaussianBlur(radius=blur_radius)
             )
         ) / 255.0
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
         rgb = np.stack([
-            (arr_b * r).astype(np.uint8),
-            (arr_b * g).astype(np.uint8),
-            (arr_b * b).astype(np.uint8),
+            (arr * r).astype(np.uint8),
+            (arr * g).astype(np.uint8),
+            (arr * b).astype(np.uint8),
         ], axis=-1)
         Image.fromarray(rgb, mode="RGB").save(maps_dir / f"{ch}.png")
 
