@@ -173,22 +173,24 @@ def _process_slide(
         for ch in ANALYSIS_CHANNELS:
             ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
 
-        # Canvas update (max-pool into downsampled grid).
+        # Canvas update — area-average into the downsampled grid.
+        # Using round() for end coords avoids 1-px gaps from floor rounding.
+        # Using Image.BOX (area averaging) instead of NEAREST eliminates the
+        # moiré pattern that NEAREST causes by sampling at fixed strides on
+        # binary predictions.
         y0_c = int(y0 * scale)
         x0_c = int(x0 * scale)
-        y1_c = int(min(y0 + grid.tile_size, grid.slide_height) * scale)
-        x1_c = int(min(x0 + grid.tile_size, grid.slide_width) * scale)
+        y1_c = round(min(y0 + grid.tile_size, grid.slide_height) * scale)
+        x1_c = round(min(x0 + grid.tile_size, grid.slide_width) * scale)
         if y1_c > y0_c and x1_c > x0_c:
             target_h, target_w = y1_c - y0_c, x1_c - x0_c
             for ch in ANALYSIS_CHANNELS:
                 patch = np.array(
                     Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
-                        (target_w, target_h), Image.NEAREST
+                        (target_w, target_h), Image.BOX
                     )
                 ) / 255.0
-                canvas[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
-                    canvas[ch][y0_c:y1_c, x0_c:x1_c], patch
-                )
+                canvas[ch][y0_c:y1_c, x0_c:x1_c] = patch
 
     with torch.inference_mode():
         for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
