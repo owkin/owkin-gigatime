@@ -1,7 +1,8 @@
 """Extract GigaTIME spatial features for all TCGA-LUAD slides.
 
-Designed for long-running tmux sessions. Saves one JSON per slide so that the
-script can be interrupted and restarted without reprocessing completed slides.
+Designed for long-running tmux sessions. Saves one JSON + per-channel PNG maps
+per slide so that the script can be interrupted and restarted without
+reprocessing completed slides.
 
 Multi-GPU usage (recommended)
 ------------------------------
@@ -17,22 +18,24 @@ Single-GPU / CPU
 
 Options
 -------
-    --output-dir DIR      Where per-slide JSONs, logs and the merged parquet go
+    --output-dir DIR      Where per-slide JSONs, PNG maps and logs go
                           (default: outputs/tcga_luad_features)
     --num-workers N       Worker processes to spawn (default: all available GPUs,
                           or 1 on CPU-only machines)
     --batch-size N        Tiles per forward pass per worker (default: 16)
     --prefetch N          Tile read-ahead buffer per worker (default: 48)
+    --map-size N          Max dimension of per-channel PNG maps in pixels (default: 1024)
     --limit N             Process at most N slides total (dry-run helper)
 
 Output
 ------
     OUTPUT_DIR/
-        <slide_stem>.json         — per-slide features + metadata
-        worker_<rank>.log         — per-worker log with timestamps
-        extract_features.log      — coordinator log
-        features.parquet          — merged table (written after all workers finish)
-        features.csv              — same, CSV copy
+        <slide_stem>.json             — per-slide features + per-channel means + metadata
+        maps/<slide_stem>/<ch>.png    — per-channel spatial map (grayscale, hot colormap)
+        worker_<rank>.log             — per-worker log with timestamps
+        extract_features.log          — coordinator log
+        features.parquet              — merged table (written after all workers finish)
+        features.csv                  — same, CSV copy
 """
 
 from __future__ import annotations
@@ -47,15 +50,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.multiprocessing as mp
 from abstra.manifest import Manifest
+from PIL import Image
 from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict_batch
+from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
+
+ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 
 FEATURE_CHANNELS = [
     "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
@@ -97,11 +105,13 @@ def _process_slide(
     device: str,
     batch_size: int,
     prefetch: int,
+    maps_dir: Path,
+    map_size: int,
 ) -> dict:
     """Run inference + feature extraction for one slide.
 
-    Returns a dict with ``features``, ``metadata``, and ``elapsed_s``.
-    Raises on any error — the caller handles it.
+    Saves per-channel PNG maps to ``maps_dir``.
+    Returns a dict with ``features``, ``channels``, ``metadata``, ``elapsed_s``.
     """
     reader = SlideReader(uri)
     w, h = reader.dimensions_at_read_level
@@ -110,34 +120,97 @@ def _process_slide(
     acc: SlideFeatureAccumulator | None = None
     buf: list = []
     n_tiles = 0
+
+    # Per-channel running pixel sums over DAPI+ tissue.
+    ch_sums: dict[str, int] = {ch: 0 for ch in ANALYSIS_CHANNELS}
+    tissue_px: int = 0
+
+    # Downsampled canvas for PNG maps — initialised on first tile.
+    canvas: dict[str, np.ndarray] = {}
+    scale: float = 1.0
+    canvas_h: int = 1
+    canvas_w: int = 1
+
     t0 = time.perf_counter()
+
+    def _update(preds: dict, tile) -> None:
+        nonlocal tissue_px
+        step = grid.tile_size - grid.overlap
+        y0 = tile.row * step
+        x0 = tile.col * step
+        th = min(y0 + grid.tile_size, grid.slide_height) - y0
+        tw = min(x0 + grid.tile_size, grid.slide_width) - x0
+
+        # Running sums: positive pixels normalised by DAPI+ tissue.
+        dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
+        tissue_px += int(dapi_mask.sum())
+        for ch in ANALYSIS_CHANNELS:
+            ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
+
+        # Canvas update (max-pool into downsampled grid).
+        y0_c = int(y0 * scale)
+        x0_c = int(x0 * scale)
+        y1_c = int(min(y0 + grid.tile_size, grid.slide_height) * scale)
+        x1_c = int(min(x0 + grid.tile_size, grid.slide_width) * scale)
+        if y1_c > y0_c and x1_c > x0_c:
+            target_h, target_w = y1_c - y0_c, x1_c - x0_c
+            for ch in ANALYSIS_CHANNELS:
+                patch = np.array(
+                    Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
+                        (target_w, target_h), Image.NEAREST
+                    )
+                ) / 255.0
+                canvas[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
+                    canvas[ch][y0_c:y1_c, x0_c:x1_c], patch
+                )
 
     with torch.inference_mode():
         for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
             if acc is None:
                 acc = SlideFeatureAccumulator(grid)
+                scale = map_size / max(grid.slide_width, grid.slide_height)
+                canvas_h = max(1, int(grid.slide_height * scale))
+                canvas_w = max(1, int(grid.slide_width * scale))
+                canvas.update({
+                    ch: np.zeros((canvas_h, canvas_w), dtype=np.float32)
+                    for ch in ANALYSIS_CHANNELS
+                })
             buf.append(tile)
             n_tiles += 1
             if len(buf) < batch_size:
                 continue
             for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                 acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
+                _update(preds, t)
             buf.clear()
 
         if buf:
             for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                 acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
+                _update(preds, t)
 
     reader.close()
 
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    features = acc.finalize()
+    # Save PNG maps.
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    for ch in ANALYSIS_CHANNELS:
+        img = Image.fromarray((canvas[ch] * 255).astype(np.uint8))
+        img.save(maps_dir / f"{ch}.png")
+
+    # Per-channel mean expression over tissue.
+    channels = {
+        ch: ch_sums[ch] / tissue_px if tissue_px > 0 else 0.0
+        for ch in ANALYSIS_CHANNELS
+    }
+
     elapsed = time.perf_counter() - t0
 
     return {
-        "features": features,
+        "features": acc.finalize(),
+        "channels": channels,
         "metadata": {
             "uri": uri,
             "slide_width_px": w,
@@ -160,11 +233,11 @@ def _worker(
     num_workers: int,
     batch_size: int,
     prefetch: int,
+    map_size: int,
 ) -> None:
     """Process slides assigned to this worker (pending[rank::num_workers])."""
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
 
-    # Per-worker log file — avoids multiprocess write conflicts on a shared file.
     log_path = output_dir / f"worker_{rank}.log"
     fmt = f"%(asctime)s  [gpu{rank}]  %(levelname)-8s  %(message)s"
     logging.basicConfig(
@@ -184,6 +257,7 @@ def _worker(
     model.eval()
     log.info("Model ready.")
 
+    maps_root = output_dir / "maps"
     my_slides = pending[rank::num_workers]
     errors: list[tuple[str, str]] = []
     slide_times: list[float] = []
@@ -193,8 +267,6 @@ def _worker(
         stem = Path(uri).stem
         out_path = output_dir / f"{stem}.json"
 
-        # Double-check in case another worker raced us (shouldn't happen with
-        # round-robin, but safe to guard against restarts with overlap).
         if out_path.exists():
             log.info(f"  SKIP (done)  {name}")
             continue
@@ -202,7 +274,11 @@ def _worker(
         log.info(f"[{idx + 1}/{len(my_slides)}] {name}")
 
         try:
-            result = _process_slide(uri, model, device, batch_size, prefetch)
+            result = _process_slide(
+                uri, model, device, batch_size, prefetch,
+                maps_dir=maps_root / stem,
+                map_size=map_size,
+            )
         except Exception as exc:
             errors.append((name, str(exc)))
             log.error(f"  FAILED: {exc}")
@@ -259,6 +335,12 @@ def main() -> None:
         help="Tile read-ahead buffer per worker (default: 48)",
     )
     parser.add_argument(
+        "--map-size",
+        type=int,
+        default=1024,
+        help="Max dimension of per-channel PNG maps in pixels (default: 1024)",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -269,7 +351,6 @@ def main() -> None:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Coordinator log (non-worker output).
     log_path = output_dir / "extract_features.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -287,8 +368,8 @@ def main() -> None:
     log.info(f"Output directory : {output_dir.resolve()}")
     log.info(f"GPUs available   : {n_gpus}  |  Workers: {args.num_workers}")
     log.info(f"Batch size       : {args.batch_size}  |  Prefetch: {args.prefetch}")
+    log.info(f"Map size         : {args.map_size}px  |  Channels: {len(ANALYSIS_CHANNELS)}")
 
-    # Discover slides.
     manifest = Manifest().load()
     dataset = manifest.datasets[TCGA_LUAD]
     all_slides = [
@@ -300,7 +381,6 @@ def main() -> None:
 
     log.info(f"Total slides     : {len(all_slides)}")
 
-    # Skip already-processed slides.
     pending = [
         uri for uri in all_slides
         if not (output_dir / f"{Path(uri).stem}.json").exists()
@@ -314,15 +394,14 @@ def main() -> None:
 
     wall_start = time.perf_counter()
 
+    worker_args = (pending, output_dir, args.num_workers, args.batch_size, args.prefetch, args.map_size)
+
     if args.num_workers == 1:
-        # Single-worker path — no multiprocessing overhead.
-        _worker(0, pending, output_dir, 1, args.batch_size, args.prefetch)
+        _worker(0, *worker_args)
     else:
-        # Spawn one process per worker. Each gets pending[rank::num_workers].
-        # 'spawn' is required for CUDA — never use 'fork' with CUDA.
         mp.start_processes(
             _worker,
-            args=(pending, output_dir, args.num_workers, args.batch_size, args.prefetch),
+            args=worker_args,
             nprocs=args.num_workers,
             start_method="spawn",
         )
@@ -353,6 +432,7 @@ def _merge_results(output_dir: Path, log: logging.Logger) -> None:
             row = {"slide": p.stem}
             row.update(data.get("metadata", {}))
             row.update(data.get("features", {}))
+            row.update(data.get("channels", {}))
             row["elapsed_s"] = data.get("elapsed_s")
             rows.append(row)
         except Exception as exc:
