@@ -45,6 +45,7 @@ import json
 import logging
 import queue
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -213,7 +214,7 @@ def _process_slide(
                     Image.fromarray((prob_patch * 255).astype(np.uint8)).resize(
                         (target_w, target_h), Image.BOX
                     )
-                ) / 255.0
+                )
                 canvas_int[ch][y0_c:y1_c, x0_c:x1_c] = patch
 
     with torch.inference_mode():
@@ -225,7 +226,7 @@ def _process_slide(
                 canvas_h_int = max(1, round(grid.slide_height * scale_int))
                 canvas_w_int = max(1, round(grid.slide_width * scale_int))
                 canvas_int.update({
-                    ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.float32)
+                    ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.uint8)
                     for ch in ANALYSIS_CHANNELS
                 })
             buf.append(tile)
@@ -267,23 +268,26 @@ def _process_slide(
 
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
-        # Global BOX downsample: intermediate → final
+        # Global BOX downsample: intermediate → final (canvas is already uint8)
         arr = np.array(
-            Image.fromarray((canvas_int[ch] * 255).astype(np.uint8)).resize(
+            Image.fromarray(canvas_int[ch]).resize(
                 (canvas_w_final, canvas_h_final), Image.BOX
             )
-        ) / 255.0
+        )
         # Gaussian blur to smooth residual inference-window boundary seams
         arr = np.array(
-            Image.fromarray((arr * 255).astype(np.uint8)).filter(
+            Image.fromarray(arr).filter(
                 ImageFilter.GaussianBlur(radius=blur_radius)
             )
-        ) / 255.0
+        )
+        # Colour multiply: use uint16 intermediate to avoid overflow before
+        # scaling back to [0, 255].
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
+        a = arr.astype(np.uint16)
         rgb = np.stack([
-            (arr * r).astype(np.uint8),
-            (arr * g).astype(np.uint8),
-            (arr * b).astype(np.uint8),
+            (a * r // 255).astype(np.uint8),
+            (a * g // 255).astype(np.uint8),
+            (a * b // 255).astype(np.uint8),
         ], axis=-1)
         Image.fromarray(rgb, mode="RGB").save(maps_dir / f"{ch}.png")
 
@@ -401,7 +405,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/tcga_luad_features"),
+        default=Path("/home/sagemaker-user/custom-file-systems/efs/fs-09913c1f7db79b6fd/gigatime_tcga_luad/outputs"),
     )
     parser.add_argument(
         "--num-workers",
@@ -437,6 +441,12 @@ def main() -> None:
 
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Redirect all temporary files (downloaded slides) to EFS so they never
+    # land in the container's tmpfs or /tmp.
+    tmp_dir = output_dir.parent / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = str(tmp_dir)
 
     log_path = output_dir / "extract_features.log"
     logging.basicConfig(
