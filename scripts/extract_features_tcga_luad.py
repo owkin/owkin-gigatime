@@ -31,7 +31,7 @@ Output
 ------
     OUTPUT_DIR/
         <slide_stem>.json             — per-slide features + per-channel means + metadata
-        maps/<slide_stem>/<ch>.png    — per-channel spatial map (grayscale, hot colormap)
+        maps/<slide_stem>/<ch>.png    — per-channel spatial map (mIF colors, black background)
         worker_<rank>.log             — per-worker log with timestamps
         extract_features.log          — coordinator log
         features.parquet              — merged table (written after all workers finish)
@@ -54,7 +54,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 from abstra.manifest import Manifest
-from PIL import Image
+from PIL import Image, ImageFilter
 from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
@@ -64,6 +64,32 @@ from gigatime.inference import load_model, predict_batch
 from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
+
+# Per-channel mIF display colors (RGB). Black background, signal in channel color.
+# Conventions follow standard multiplex immunofluorescence panel assignments.
+CHANNEL_COLORS: dict[str, tuple[int, int, int]] = {
+    "DAPI":        (100, 149, 237),  # cornflower blue  — nuclei
+    "CK":          (255, 255,   0),  # yellow           — tumour cells
+    "CD3":         ( 50, 205,  50),  # lime green       — pan T-cells
+    "CD8":         (  0, 255, 255),  # cyan             — cytotoxic T-cells
+    "CD4":         (144, 238, 144),  # light green      — helper T-cells
+    "CD68":        (255, 165,   0),  # orange           — macrophages
+    "PD-L1":       (255,   0,   0),  # red              — immune checkpoint (tumour)
+    "PD-1":        (255,   0, 255),  # magenta          — exhaustion / activation
+    "CD20":        (255, 215,   0),  # gold             — B-cells
+    "Ki67":        (255, 100,   0),  # orange-red       — proliferation
+    "CD34":        (220,  20,  60),  # crimson          — vasculature
+    "CD138":       (148,   0, 211),  # violet           — plasma cells
+    "CD11c":       (255, 200,   0),  # amber            — dendritic cells
+    "CD14":        (210, 105,  30),  # chocolate        — monocytes
+    "CD16":        (189, 183, 107),  # dark khaki       — NK cells / neutrophils
+    "T-bet":       (  0, 191, 255),  # deep sky blue    — Th1 / CD8 transcription factor
+    "Tryptase":    (186,  85, 211),  # medium orchid    — mast cells
+    "Actin-D":     (169, 169, 169),  # dark grey        — smooth muscle / myofibroblasts
+    "Caspase3-D":  (127, 255,   0),  # chartreuse       — apoptosis
+    "PHH3-B":      (255, 255, 102),  # pale yellow      — mitosis
+    "Transgelin":  (119, 136, 153),  # light slate grey — smooth muscle actin
+}
 
 FEATURE_CHANNELS = [
     "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
@@ -194,11 +220,24 @@ def _process_slide(
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    # Save PNG maps.
+    # Save PNG maps with per-channel mIF colors.
+    # A small Gaussian blur removes the 256px window-boundary seam pattern
+    # that appears in the canvas without affecting spatial feature values
+    # (those are computed from raw binary predictions, not the canvas).
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
-        img = Image.fromarray((canvas[ch] * 255).astype(np.uint8))
-        img.save(maps_dir / f"{ch}.png")
+        arr = canvas[ch]  # float32 [0, 1]
+        blurred = Image.fromarray((arr * 255).astype(np.uint8)).filter(
+            ImageFilter.GaussianBlur(radius=1)
+        )
+        arr_b = np.array(blurred) / 255.0
+        r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
+        rgb = np.stack([
+            (arr_b * r).astype(np.uint8),
+            (arr_b * g).astype(np.uint8),
+            (arr_b * b).astype(np.uint8),
+        ], axis=-1)
+        Image.fromarray(rgb, mode="RGB").save(maps_dir / f"{ch}.png")
 
     # Per-channel mean expression over tissue.
     channels = {
