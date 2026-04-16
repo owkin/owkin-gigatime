@@ -19,7 +19,7 @@ Single-GPU / CPU
 Options
 -------
     --output-dir DIR      Where per-slide JSONs, PNG maps and logs go
-                          (default: outputs/tcga_luad_features)
+                          (default: EFS outputs directory)
     --num-workers N       Worker processes to spawn (default: all available GPUs,
                           or 1 on CPU-only machines)
     --batch-size N        Tiles per forward pass per worker (default: 16)
@@ -48,21 +48,21 @@ import queue
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.multiprocessing as mp
 from abstra.manifest import Manifest
-from PIL import Image, ImageFilter
+from PIL import Image
 from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict_batch
-from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES, INFERENCE_WINDOW_SIZE
+from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 
@@ -96,13 +96,6 @@ FEATURE_CHANNELS = [
     "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
     "PD-1", "PD-L1", "Ki67", "Caspase3-D",
 ]
-
-# Intermediate canvas resolution for artifact-free downsampling.
-# Tiles are placed at this resolution; a single BOX downsample to the final
-# map_size then averages across tile boundaries, eliminating the moiré that
-# appears when each tile is resized independently to the small final canvas.
-CANVAS_INTERMEDIATE_SIZE = 4096
-
 
 # ---------------------------------------------------------------------------
 # Tile prefetch helper
@@ -158,22 +151,8 @@ def _process_slide(
     ch_sums: dict[str, int] = {ch: 0 for ch in ANALYSIS_CHANNELS}
     tissue_px: int = 0
 
-    # Intermediate canvas for PNG maps.
-    # Tiles are placed at CANVAS_INTERMEDIATE_SIZE resolution using raw model
-    # probabilities (continuous [0,1] — much smoother than binary {0,1} masks).
-    # A single global BOX downsample to map_size then averages across tile
-    # boundaries, and a final Gaussian blur sized to the inference-window
-    # footprint blends the residual 256px seam artifacts.
-    canvas_int: dict[str, np.ndarray] = {}
-    scale_int: float = 1.0
-    canvas_h_int: int = 1
-    canvas_w_int: int = 1
-
-    # read_downsample != 1 when the slide MPP doesn't exactly match the target
-    # (e.g. 40x slides at 0.25 µm/px).  In that case iter_tiles downscales each
-    # tile before padding it to tile_size, so only the first
-    # round(tile_size / rd) pixels in each axis contain valid slide content.
-    rd = reader.read_downsample
+    canvas: dict[str, np.ndarray] = {}
+    scale: float = 1.0
 
     t0 = time.perf_counter()
 
@@ -186,36 +165,26 @@ def _process_slide(
         x1 = min(x0 + grid.tile_size, grid.slide_width)
         th = y1 - y0
         tw = x1 - x0
-        # Crop to the valid prediction region: when rd != 1 the tile was
-        # resized before padding, so predictions beyond valid_th/valid_tw
-        # correspond to white padding rather than real slide content.
-        valid_th = min(round(th / rd), grid.tile_size)
-        valid_tw = min(round(tw / rd), grid.tile_size)
 
-        # Running sums: positive pixels normalised by DAPI+ tissue (binary).
-        dapi_mask = preds["DAPI"][:valid_th, :valid_tw].astype(bool)
+        dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
         tissue_px += int(dapi_mask.sum())
         for ch in ANALYSIS_CHANNELS:
-            ch_sums[ch] += int((preds[ch][:valid_th, :valid_tw].astype(bool) & dapi_mask).sum())
+            ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
 
-        # Canvas update: use raw probabilities, crop to valid region.
-        # round() for both endpoints so adjacent tiles abut with no pixel gaps.
-        probs = preds["probabilities"]  # (H, W, C) float32
-        y0_c = round(y0 * scale_int)
-        x0_c = round(x0 * scale_int)
-        y1_c = round(y1 * scale_int)
-        x1_c = round(x1 * scale_int)
+        y0_c = int(y0 * scale)
+        x0_c = int(x0 * scale)
+        y1_c = int(y1 * scale)
+        x1_c = int(x1 * scale)
         if y1_c > y0_c and x1_c > x0_c:
-            target_h, target_w = y1_c - y0_c, x1_c - x0_c
             for ch in ANALYSIS_CHANNELS:
-                ch_idx = CHANNEL_NAMES.index(ch)
-                prob_patch = probs[:valid_th, :valid_tw, ch_idx]
                 patch = np.array(
-                    Image.fromarray((prob_patch * 255).astype(np.uint8)).resize(
-                        (target_w, target_h), Image.BOX
+                    Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
+                        (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
                     )
                 )
-                canvas_int[ch][y0_c:y1_c, x0_c:x1_c] = patch
+                canvas[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
+                    canvas[ch][y0_c:y1_c, x0_c:x1_c], patch
+                )
 
     try:
         with torch.inference_mode():
@@ -223,32 +192,24 @@ def _process_slide(
                 if acc is None:
                     acc = SlideFeatureAccumulator(grid)
                     slide_max = max(grid.slide_width, grid.slide_height)
-                    scale_int = max(CANVAS_INTERMEDIATE_SIZE, map_size) / slide_max
-                    canvas_h_int = max(1, round(grid.slide_height * scale_int))
-                    canvas_w_int = max(1, round(grid.slide_width * scale_int))
-                    canvas_int.update({
-                        ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.uint8)
+                    scale = map_size / slide_max
+                    canvas_h = max(1, int(grid.slide_height * scale))
+                    canvas_w = max(1, int(grid.slide_width * scale))
+                    canvas.update({
+                        ch: np.zeros((canvas_h, canvas_w), dtype=np.uint8)
                         for ch in ANALYSIS_CHANNELS
                     })
                 buf.append(tile)
                 n_tiles += 1
                 if len(buf) < batch_size:
                     continue
-                batch_preds = predict_batch(
-                    [t.array for t in buf], model, device=device,
-                    return_probabilities=True, overlap=64,
-                )
-                for t, preds in zip(buf, batch_preds):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
                 buf.clear()
 
             if buf:
-                batch_preds = predict_batch(
-                    [t.array for t in buf], model, device=device,
-                    return_probabilities=True, overlap=64,
-                )
-                for t, preds in zip(buf, batch_preds):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
     finally:
@@ -257,34 +218,10 @@ def _process_slide(
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
-    # Downsample intermediate canvas → final map_size with a global BOX filter,
-    # then apply a Gaussian blur sized to the inference-window footprint so that
-    # seams between adjacent 256px windows are blended in the final image.
-    slide_max = max(grid.slide_width, grid.slide_height)
-    scale_final = map_size / slide_max
-    canvas_h_final = max(1, round(grid.slide_height * scale_final))
-    canvas_w_final = max(1, round(grid.slide_width * scale_final))
-    window_px_in_canvas = max(1, round(INFERENCE_WINDOW_SIZE * scale_final))
-    blur_radius = max(2, window_px_in_canvas // 2)
-
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
-        # Global BOX downsample: intermediate → final (canvas is already uint8)
-        arr = np.array(
-            Image.fromarray(canvas_int[ch]).resize(
-                (canvas_w_final, canvas_h_final), Image.BOX
-            )
-        )
-        # Gaussian blur to smooth residual inference-window boundary seams
-        arr = np.array(
-            Image.fromarray(arr).filter(
-                ImageFilter.GaussianBlur(radius=blur_radius)
-            )
-        )
-        # Colour multiply: use uint16 intermediate to avoid overflow before
-        # scaling back to [0, 255].
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
-        a = arr.astype(np.uint16)
+        a = canvas[ch].astype(np.uint16)
         rgb = np.stack([
             (a * r // 255).astype(np.uint8),
             (a * g // 255).astype(np.uint8),
@@ -308,7 +245,7 @@ def _process_slide(
             "slide_width_px": w,
             "slide_height_px": h,
             "n_tiles": n_tiles,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
         },
         "elapsed_s": elapsed,
     }
@@ -417,8 +354,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=7,
-        help="Tiles per forward pass per worker (default: 7)",
+        default=16,
+        help="Tiles per forward pass per worker (default: 16)",
     )
     parser.add_argument(
         "--prefetch",
@@ -443,16 +380,12 @@ def main() -> None:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Redirect all temporary files (downloaded slides) to EFS so they never
-    # land in the container's tmpfs or /tmp.  Must use os.environ so that
-    # spawned worker processes inherit the setting (tempfile.tempdir is a
-    # Python-only variable that does not survive multiprocessing spawn).
+    # Keep downloaded slides and the HuggingFace model cache beside the output
+    # directory. os.environ is used so spawned worker processes inherit both.
     tmp_dir = output_dir.parent / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     os.environ["TMPDIR"] = str(tmp_dir)
 
-    # Redirect HuggingFace model cache to EFS — the model weights are several
-    # GB and would otherwise fill the container's root filesystem on first run.
     hf_cache_dir = output_dir.parent / "hf_cache"
     hf_cache_dir.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(hf_cache_dir)
