@@ -43,9 +43,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import queue
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime
@@ -217,41 +217,42 @@ def _process_slide(
                 )
                 canvas_int[ch][y0_c:y1_c, x0_c:x1_c] = patch
 
-    with torch.inference_mode():
-        for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
-            if acc is None:
-                acc = SlideFeatureAccumulator(grid)
-                slide_max = max(grid.slide_width, grid.slide_height)
-                scale_int = max(CANVAS_INTERMEDIATE_SIZE, map_size) / slide_max
-                canvas_h_int = max(1, round(grid.slide_height * scale_int))
-                canvas_w_int = max(1, round(grid.slide_width * scale_int))
-                canvas_int.update({
-                    ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.uint8)
-                    for ch in ANALYSIS_CHANNELS
-                })
-            buf.append(tile)
-            n_tiles += 1
-            if len(buf) < batch_size:
-                continue
-            batch_preds = predict_batch(
-                [t.array for t in buf], model, device=device,
-                return_probabilities=True, overlap=64,
-            )
-            for t, preds in zip(buf, batch_preds):
-                acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
-                _update(preds, t)
-            buf.clear()
+    try:
+        with torch.inference_mode():
+            for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
+                if acc is None:
+                    acc = SlideFeatureAccumulator(grid)
+                    slide_max = max(grid.slide_width, grid.slide_height)
+                    scale_int = max(CANVAS_INTERMEDIATE_SIZE, map_size) / slide_max
+                    canvas_h_int = max(1, round(grid.slide_height * scale_int))
+                    canvas_w_int = max(1, round(grid.slide_width * scale_int))
+                    canvas_int.update({
+                        ch: np.zeros((canvas_h_int, canvas_w_int), dtype=np.uint8)
+                        for ch in ANALYSIS_CHANNELS
+                    })
+                buf.append(tile)
+                n_tiles += 1
+                if len(buf) < batch_size:
+                    continue
+                batch_preds = predict_batch(
+                    [t.array for t in buf], model, device=device,
+                    return_probabilities=True, overlap=64,
+                )
+                for t, preds in zip(buf, batch_preds):
+                    acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
+                    _update(preds, t)
+                buf.clear()
 
-        if buf:
-            batch_preds = predict_batch(
-                [t.array for t in buf], model, device=device,
-                return_probabilities=True, overlap=64,
-            )
-            for t, preds in zip(buf, batch_preds):
-                acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
-                _update(preds, t)
-
-    reader.close()
+            if buf:
+                batch_preds = predict_batch(
+                    [t.array for t in buf], model, device=device,
+                    return_probabilities=True, overlap=64,
+                )
+                for t, preds in zip(buf, batch_preds):
+                    acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
+                    _update(preds, t)
+    finally:
+        reader.close()
 
     if grid is None or acc is None:
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
@@ -416,8 +417,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Tiles per forward pass per worker (default: 16)",
+        default=7,
+        help="Tiles per forward pass per worker (default: 7)",
     )
     parser.add_argument(
         "--prefetch",
@@ -443,10 +444,18 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Redirect all temporary files (downloaded slides) to EFS so they never
-    # land in the container's tmpfs or /tmp.
+    # land in the container's tmpfs or /tmp.  Must use os.environ so that
+    # spawned worker processes inherit the setting (tempfile.tempdir is a
+    # Python-only variable that does not survive multiprocessing spawn).
     tmp_dir = output_dir.parent / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    tempfile.tempdir = str(tmp_dir)
+    os.environ["TMPDIR"] = str(tmp_dir)
+
+    # Redirect HuggingFace model cache to EFS — the model weights are several
+    # GB and would otherwise fill the container's root filesystem on first run.
+    hf_cache_dir = output_dir.parent / "hf_cache"
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_cache_dir)
 
     log_path = output_dir / "extract_features.log"
     logging.basicConfig(
