@@ -198,13 +198,16 @@ def _sliding_window_inference_batch(
     with torch.no_grad():
         logits = model(crops)  # (n_windows * B, C, window_size, window_size)
 
-    probs = torch.sigmoid(logits).reshape(n_windows, B, _N_CLASSES, window_size, window_size)
+    # crops was built (B, n_windows, ...) then reshaped to (B*n_windows, ...), so
+    # logits are in B-major order: [t0w0, t0w1, ..., t0w(n-1), t1w0, ...].
+    # Reshape back to (B, n_windows, ...) — NOT (n_windows, B, ...).
+    probs = torch.sigmoid(logits).reshape(B, n_windows, _N_CLASSES, window_size, window_size)
 
     accumulator = torch.zeros(B, _N_CLASSES, h, w, device=x.device)
     count_map = torch.zeros(B, 1, h, w, device=x.device)
 
     for k, (r0, r1, c0, c1) in enumerate(positions):
-        accumulator[:, :, r0:r1, c0:c1] += probs[k]
+        accumulator[:, :, r0:r1, c0:c1] += probs[:, k]  # (B, C, tile_h, tile_w)
         count_map[:, :, r0:r1, c0:c1] += 1
 
     return accumulator / count_map

@@ -58,7 +58,7 @@ def _mif_cmap(channel: str) -> LinearSegmentedColormap:
     return LinearSegmentedColormap.from_list(channel, ["black", (r / 255, g / 255, b / 255)])
 
 BATCH_SIZE = 16  # increase if GPU memory allows
-CHANNELS_TO_DISPLAY = ["CD8", "CD3", "PD-1", "PD-L1", "CK", "CD4"]
+CHANNELS_TO_DISPLAY = ["DAPI", "CD8", "CD3", "PD-1", "PD-L1", "CK", "CD4"]
 ANALYSIS_CHANNELS = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 N_SAMPLE_TILES = 3
 CANVAS_MAX_DIM = 2048   # downsampled canvas for display
@@ -105,7 +105,14 @@ vis_scale = 1.0
 all_scale = 1.0
 
 def _process_tile(tile, preds, grid, step):
-    """Update canvases, stats and reservoir sample for one tile."""
+    """Update canvases, stats and reservoir sample for one tile.
+
+    preds must have been produced with return_probabilities=True so that
+    preds["probabilities"] is the raw (H, W, C) sigmoid array.  The per-channel
+    binary masks (preds[ch]) are still used for positive-fraction stats.
+    """
+    probs_hwc = preds["probabilities"]  # (H, W, C) float32 in [0, 1]
+
     for ch in CHANNEL_NAMES:
         sums[ch] += float(preds[ch].sum())
         pixel_counts[ch] += preds[ch].size
@@ -119,17 +126,20 @@ def _process_tile(tile, preds, grid, step):
         y1_c, x1_c = int(y1_full * s), int(x1_full * s)
         if y1_c > y0_c and x1_c > x0_c:
             for ch in canvas_dict:
-                patch = np.array(
-                    Image.fromarray((preds[ch] * 255).astype(np.uint8)).resize(
+                ch_idx = CHANNEL_NAMES.index(ch)
+                prob_slice = probs_hwc[..., ch_idx]  # (H, W), continuous [0, 1]
+                patch = (np.array(
+                    Image.fromarray((prob_slice * 255).astype(np.uint8)).resize(
                         (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
                     )
-                ) / 255.0
+                ) / 255.0).astype(np.float16)
                 canvas_dict[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
                     canvas_dict[ch][y0_c:y1_c, x0_c:x1_c], patch
                 )
 
     global n_tiles
-    tile_data = (tile.array.copy(), {ch: preds[ch] for ch in CHANNELS_TO_DISPLAY})
+    # Store probabilities (not binary) for full-res tile display
+    tile_data = (tile.array.copy(), {ch: probs_hwc[..., CHANNEL_NAMES.index(ch)] for ch in CHANNELS_TO_DISPLAY})
     if n_tiles < N_SAMPLE_TILES:
         sampled_tiles.append(tile_data)
     else:
@@ -152,11 +162,11 @@ with torch.inference_mode():
             vis_scale = CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
             all_scale = ALL_CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
             vis_canvas.update({
-                ch: np.zeros((max(1, int(grid.slide_height * vis_scale)), max(1, int(grid.slide_width * vis_scale))), dtype=np.float32)
+                ch: np.zeros((max(1, int(grid.slide_height * vis_scale)), max(1, int(grid.slide_width * vis_scale))), dtype=np.float16)
                 for ch in CHANNELS_TO_DISPLAY
             })
             all_canvas.update({
-                ch: np.zeros((max(1, int(grid.slide_height * all_scale)), max(1, int(grid.slide_width * all_scale))), dtype=np.float32)
+                ch: np.zeros((max(1, int(grid.slide_height * all_scale)), max(1, int(grid.slide_width * all_scale))), dtype=np.float16)
                 for ch in ANALYSIS_CHANNELS
             })
 
@@ -164,12 +174,12 @@ with torch.inference_mode():
         if len(tile_buf) < BATCH_SIZE:
             continue
 
-        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE)):
+        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE, return_probabilities=True)):
             _process_tile(t, preds, grid, step)
         tile_buf = []
 
     if tile_buf:
-        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE)):
+        for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE, return_probabilities=True)):
             _process_tile(t, preds, grid, step)
 
 assert grid is not None, "No tissue tiles found — check min_tissue_fraction or slide content"
@@ -193,14 +203,16 @@ axes[0].axis("off")
 
 # Channel panels — vis_canvas is already downsampled, resize only to match thumbnail
 for ax, channel in zip(axes[1:], CHANNELS_TO_DISPLAY):
-    arr = vis_canvas[channel]
-    p999 = np.percentile(arr[arr > 0], 99.9) if (arr > 0).any() else 1.0
-    arr = np.clip(arr, 0, p999) / p999
+    arr = vis_canvas[channel]  # raw float32, already in [0, 1]
     disp = np.array(Image.fromarray((arr * 255).astype(np.uint8)).resize(
         (thumb_w, thumb_h), Image.NEAREST
     ))
     ax.imshow(disp, cmap=_mif_cmap(channel), vmin=0, vmax=255)
-    ax.set_title(channel, fontsize=12)
+    nz = arr[arr > 0]
+    ax.set_title(
+        f"{channel}\nmed={np.median(nz):.2f} p99={np.percentile(nz, 99):.2f}" if nz.size else channel,
+        fontsize=9,
+    )
     ax.axis("off")
 
 # Hide any unused axes
@@ -212,24 +224,25 @@ plt.tight_layout()
 plt.show()
 
 # %%
-# DAPI channel histogram
-dapi_arr = vis_canvas["DAPI"]
-dapi_nonzero = dapi_arr[dapi_arr > 0]
-fig, ax = plt.subplots(figsize=(6, 3))
-ax.hist(dapi_nonzero.ravel(), bins=100, color=(100 / 255, 149 / 255, 237 / 255), edgecolor="none")
-p999_dapi = np.percentile(dapi_nonzero, 99.9) if dapi_nonzero.size > 0 else 1.0
-ax.axvline(p999_dapi, color="white", linestyle="--", linewidth=1.2, label=f"99.9th pct = {p999_dapi:.3f}")
-ax.set_facecolor("black")
+# Per-channel histograms for CHANNELS_TO_DISPLAY — raw probabilities, no clipping
+fig, axes_h = plt.subplots(1, len(CHANNELS_TO_DISPLAY), figsize=(4 * len(CHANNELS_TO_DISPLAY), 3))
 fig.patch.set_facecolor("#111111")
-ax.tick_params(colors="white")
-ax.xaxis.label.set_color("white")
-ax.yaxis.label.set_color("white")
-ax.title.set_color("white")
-ax.spines[:].set_color("#444444")
-ax.set_xlabel("Probability")
-ax.set_ylabel("Pixel count")
-ax.set_title("DAPI — pixel intensity distribution (tissue tiles only)")
-ax.legend(facecolor="#222222", labelcolor="white", framealpha=0.8)
+for ax, channel in zip(axes_h, CHANNELS_TO_DISPLAY):
+    nz = vis_canvas[channel]
+    nz = nz[nz > 0].ravel()
+    r, g, b = MIF_COLORS.get(channel, (255, 255, 255))
+    ax.hist(nz, bins=80, color=(r / 255, g / 255, b / 255), edgecolor="none", density=True)
+    for pct, ls in ((50, ":"), (99, "--"), (99.9, "-")):
+        v = np.percentile(nz, pct) if nz.size else 0
+        ax.axvline(v, color="white", linestyle=ls, linewidth=1.0, alpha=0.8)
+        ax.text(v, ax.get_ylim()[1] * 0.95, f"p{pct}\n{v:.2f}", color="white",
+                fontsize=6, ha="center", va="top")
+    ax.set_facecolor("black")
+    ax.tick_params(colors="white", labelsize=7)
+    ax.spines[:].set_color("#444444")
+    ax.set_title(channel, color="white", fontsize=10)
+    ax.set_xlabel("prob", color="white", fontsize=8)
+fig.suptitle("Raw probability distributions — tissue pixels only", color="white", fontsize=11)
 plt.tight_layout()
 plt.show()
 
@@ -272,9 +285,7 @@ n_rows_grid = (n_ch + n_cols_grid - 1) // n_cols_grid
 fig, axes = plt.subplots(n_rows_grid, n_cols_grid, figsize=(3.5 * n_cols_grid, 3.5 * n_rows_grid))
 axes = axes.flatten()
 for i, ch in enumerate(ANALYSIS_CHANNELS):
-    arr = all_canvas[ch]
-    p999 = np.percentile(arr[arr > 0], 99.9) if (arr > 0).any() else 1.0
-    arr = np.clip(arr, 0, p999) / p999
+    arr = all_canvas[ch]  # raw float32, no clipping
     disp = np.array(Image.fromarray((arr * 255).astype(np.uint8)).resize((512, 512), Image.NEAREST))
     axes[i].imshow(disp, cmap=_mif_cmap(ch), vmin=0, vmax=255)
     axes[i].set_title(ch, fontsize=10)
