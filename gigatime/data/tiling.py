@@ -41,10 +41,16 @@ class TileGrid:
     Attributes:
         n_rows: Number of tile rows.
         n_cols: Number of tile columns.
-        tile_size: Tile size in pixels (height == width).
+        tile_size: Tile size in pixels (height == width). Coordinates in this
+            grid (row, col, slide_width, slide_height) are all expressed at the
+            read level, i.e. *before* the residual rescaling to 20x.
         overlap: Overlap between adjacent tiles in pixels.
         slide_width: Width of the slide at the read level in pixels.
         slide_height: Height of the slide at the read level in pixels.
+        read_downsample: Residual rescaling factor applied inside each tile.
+            For a 20x slide this is 1.0; for a 40x slide read at level 0 it
+            is 2.0.  Divide a read-level length by this value to get the
+            corresponding length in the 20x prediction array.
     """
 
     n_rows: int
@@ -53,6 +59,7 @@ class TileGrid:
     overlap: int
     slide_width: int
     slide_height: int
+    read_downsample: float = 1.0
 
     @property
     def n_tiles(self) -> int:
@@ -102,6 +109,7 @@ def iter_tiles(
         overlap=overlap,
         slide_width=slide_w,
         slide_height=slide_h,
+        read_downsample=reader.read_downsample,
     )
 
     level_ds = reader._slide.level_downsamples[reader.read_level]

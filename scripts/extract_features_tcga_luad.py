@@ -22,7 +22,7 @@ Options
                           (default: EFS outputs directory)
     --num-workers N       Worker processes to spawn (default: all available GPUs,
                           or 1 on CPU-only machines)
-    --batch-size N        Tiles per forward pass per worker (default: 16)
+    --batch-size N        Tiles per forward pass per worker (default: 7)
     --prefetch N          Tile read-ahead buffer per worker (default: 48)
     --map-size N          Max dimension of per-channel PNG maps in pixels (default: 1024)
     --limit N             Process at most N slides total (dry-run helper)
@@ -159,12 +159,14 @@ def _process_slide(
     def _update(preds: dict, tile) -> None:
         nonlocal tissue_px
         step = grid.tile_size - grid.overlap
+        rd = grid.read_downsample
         y0 = tile.row * step
         x0 = tile.col * step
         y1 = min(y0 + grid.tile_size, grid.slide_height)
         x1 = min(x0 + grid.tile_size, grid.slide_width)
-        th = y1 - y0
-        tw = x1 - x0
+        # Convert read-level extents to 20x prediction-array pixel counts.
+        th = round((y1 - y0) / rd)
+        tw = round((x1 - x0) / rd)
 
         dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
         tissue_px += int(dapi_mask.sum())
@@ -179,7 +181,7 @@ def _process_slide(
             for ch in ANALYSIS_CHANNELS:
                 patch = np.array(
                     Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
-                        (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
+                        (x1_c - x0_c, y1_c - y0_c), Image.BOX
                     )
                 )
                 canvas[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
@@ -203,13 +205,13 @@ def _process_slide(
                 n_tiles += 1
                 if len(buf) < batch_size:
                     continue
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device, overlap=64)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
                 buf.clear()
 
             if buf:
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device, overlap=64)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
     finally:
@@ -354,8 +356,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Tiles per forward pass per worker (default: 16)",
+        default=7,
+        help="Tiles per forward pass per worker (default: 7)",
     )
     parser.add_argument(
         "--prefetch",
