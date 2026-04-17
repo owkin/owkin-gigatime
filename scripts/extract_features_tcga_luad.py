@@ -165,6 +165,7 @@ def _process_slide(
 
     canvas: dict[str, np.ndarray] = {}
     scale: float = 1.0
+    he_thumbnail: np.ndarray | None = None
 
     t0 = time.perf_counter()
 
@@ -186,9 +187,11 @@ def _process_slide(
         y1_c = int(y1 * scale)
         x1_c = int(x1 * scale)
         if y1_c > y0_c and x1_c > x0_c:
+            probs_hwc = preds["probabilities"]  # (H, W, C) float32 sigmoid
             for ch in ANALYSIS_CHANNELS:
+                prob_slice = probs_hwc[..., CHANNEL_NAMES.index(ch)]
                 patch = np.array(
-                    Image.fromarray((preds[ch] * 255).astype(np.uint8)).resize(
+                    Image.fromarray((prob_slice * 255).astype(np.uint8)).resize(
                         (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
                     )
                 )
@@ -205,6 +208,11 @@ def _process_slide(
                     scale = map_size / slide_max
                     canvas_h = max(1, int(grid.slide_height * scale))
                     canvas_w = max(1, int(grid.slide_width * scale))
+                    he_thumbnail = np.array(
+                        reader._slide.get_thumbnail((canvas_w, canvas_h))
+                        .convert("RGB")
+                        .resize((canvas_w, canvas_h), Image.LANCZOS)
+                    )
                     canvas.update(
                         {
                             ch: np.zeros((canvas_h, canvas_w), dtype=np.uint8)
@@ -216,7 +224,7 @@ def _process_slide(
                 if len(buf) < batch_size:
                     continue
                 for t, preds in zip(
-                    buf, predict_batch([t.array for t in buf], model, device=device)
+                    buf, predict_batch([t.array for t in buf], model, device=device, return_probabilities=True)
                 ):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
@@ -224,7 +232,7 @@ def _process_slide(
 
             if buf:
                 for t, preds in zip(
-                    buf, predict_batch([t.array for t in buf], model, device=device)
+                    buf, predict_batch([t.array for t in buf], model, device=device, return_probabilities=True)
                 ):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
@@ -235,11 +243,13 @@ def _process_slide(
         raise RuntimeError("No tissue tiles found — check slide content or min_tissue_fraction")
 
     maps_dir.mkdir(parents=True, exist_ok=True)
+    if he_thumbnail is not None:
+        Image.fromarray(he_thumbnail).save(maps_dir / "HE.png")
     for ch in ANALYSIS_CHANNELS:
         arr = canvas[ch]
-        p995 = np.percentile(arr[arr > 0], 99.5) if (arr > 0).any() else 1.0
-        arr = np.clip(arr, 0, p995)
-        arr = (arr * 255.0 / p995).astype(np.uint8)
+        p999 = np.percentile(arr[arr > 0], 99.9) if (arr > 0).any() else 1.0
+        arr = np.clip(arr, 0, p999)
+        arr = (arr * 255.0 / p999).astype(np.uint8)
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
         a = arr.astype(np.uint16)
         rgb = np.stack(
