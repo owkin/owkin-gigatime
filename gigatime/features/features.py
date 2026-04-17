@@ -69,13 +69,13 @@ class SlideFeatureAccumulator:
         H, W = grid.slide_height, grid.slide_width
         step = grid.tile_size - grid.overlap
         ts = grid.tile_size
-        rd = grid.read_downsample
         y0 = tile.row * step
         x0 = tile.col * step
-        # th/tw are read-level pixel counts; divide by rd to get the number of
-        # valid pixels in the 20x prediction array (padding beyond this is white).
-        th = round((min(y0 + ts, H) - y0) / rd)
-        tw = round((min(x0 + ts, W) - x0) / rd)
+        # th/tw crop the prediction array to the valid (non-padded) region for
+        # edge tiles. Grid coordinates are in target-MPP space, matching the
+        # prediction array dimensions directly.
+        th = min(y0 + ts, H) - y0
+        tw = min(x0 + ts, W) - x0
 
         ck = preds["CK"][:th, :tw].astype(bool)
         dapi = preds["DAPI"][:th, :tw].astype(bool)

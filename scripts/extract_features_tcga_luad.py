@@ -159,19 +159,15 @@ def _process_slide(
     def _update(preds: dict, tile) -> None:
         nonlocal tissue_px
         step = grid.tile_size - grid.overlap
-        rd = grid.read_downsample
         y0 = tile.row * step
         x0 = tile.col * step
         y1 = min(y0 + grid.tile_size, grid.slide_height)
         x1 = min(x0 + grid.tile_size, grid.slide_width)
-        # Convert read-level extents to 20x prediction-array pixel counts.
-        th = round((y1 - y0) / rd)
-        tw = round((x1 - x0) / rd)
 
-        dapi_mask = preds["DAPI"][:th, :tw].astype(bool)
+        dapi_mask = preds["DAPI"].astype(bool)
         tissue_px += int(dapi_mask.sum())
         for ch in ANALYSIS_CHANNELS:
-            ch_sums[ch] += int((preds[ch][:th, :tw].astype(bool) & dapi_mask).sum())
+            ch_sums[ch] += int((preds[ch].astype(bool) & dapi_mask).sum())
 
         y0_c = int(y0 * scale)
         x0_c = int(x0 * scale)
@@ -180,8 +176,8 @@ def _process_slide(
         if y1_c > y0_c and x1_c > x0_c:
             for ch in ANALYSIS_CHANNELS:
                 patch = np.array(
-                    Image.fromarray((preds[ch][:th, :tw] * 255).astype(np.uint8)).resize(
-                        (x1_c - x0_c, y1_c - y0_c), Image.BOX
+                    Image.fromarray((preds[ch] * 255).astype(np.uint8)).resize(
+                        (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
                     )
                 )
                 canvas[ch][y0_c:y1_c, x0_c:x1_c] = np.maximum(
@@ -205,13 +201,13 @@ def _process_slide(
                 n_tiles += 1
                 if len(buf) < batch_size:
                     continue
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device, overlap=64)):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
                 buf.clear()
 
             if buf:
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device, overlap=64)):
+                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
     finally:
@@ -222,8 +218,12 @@ def _process_slide(
 
     maps_dir.mkdir(parents=True, exist_ok=True)
     for ch in ANALYSIS_CHANNELS:
+        arr = canvas[ch]
+        p995 = np.percentile(arr[arr > 0], 99.5) if (arr > 0).any() else 1.0
+        arr = np.clip(arr, 0, p995)
+        arr = (arr * 255.0 / p995).astype(np.uint8)
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
-        a = canvas[ch].astype(np.uint16)
+        a = arr.astype(np.uint16)
         rgb = np.stack([
             (a * r // 255).astype(np.uint8),
             (a * g // 255).astype(np.uint8),

@@ -1,13 +1,11 @@
-"""Validate model output at full resolution on a contiguous tissue patch.
+"""Validate canvas rendering on 300 tissue tiles using the real model.
 
-Finds a tissue tile well inside the slide (skips the first N_SKIP tissue tiles
-to avoid edge positions), reads PATCH_TILES × PATCH_TILES tiles around it as a
-single region at the correct resolution, runs the model, and saves:
-
-  test_fullres_patch.png  —  left: H&E  |  right: DAPI probability (blue)
+Runs inference on the first N_TILES tissue tiles, projects predictions onto a
+slide-level canvas, and saves a colorized DAPI PNG for visual inspection.
 
 Run with:
     python scripts/test_map_rendering.py
+Output: test_dapi_canvas.png
 """
 
 import sys
@@ -19,13 +17,13 @@ import numpy as np
 from abstra.manifest import Manifest
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
-from gigatime.inference import load_model, predict
+from gigatime.inference import load_model, predict_batch
 
-DEVICE    = "cuda:0" if torch.cuda.is_available() else "cpu"
-PATCH_TILES = 10      # patch side in tiles (10 → 5120 px at 20x ≈ 2.5 mm)
-TILE_SIZE   = 512
-N_SKIP      = 50      # skip this many tissue tiles so we land inside the tissue
-DAPI_COLOR  = (100, 149, 237)
+DEVICE     = "cuda:0" if torch.cuda.is_available() else "cpu"
+N_TILES    = 300
+BATCH_SIZE = 7
+MAP_SIZE   = 512
+DAPI_COLOR = (100, 149, 237)
 
 # ---------------------------------------------------------------------------
 
@@ -39,108 +37,77 @@ uri = slides[0]
 print(f"Slide : {Path(uri).name}")
 print(f"Device: {DEVICE}")
 
-reader   = SlideReader(uri)
-slide_w, slide_h = reader.dimensions_at_read_level
-level_ds = reader._slide.level_downsamples[reader.read_level]
-rd       = reader.read_downsample          # residual rescale factor
-print(f"Slide at read level : {slide_w} × {slide_h} px")
-print(f"read_downsample     : {rd:.3f}")
+print(f"Collecting first {N_TILES} tissue tiles...")
+reader = SlideReader(uri)
+print(f"DZ level : {reader.dz_level}  |  MPP metadata: {reader.metadata.mpp:.4f} µm/px")
 
-# Find a tissue tile well inside the tissue by skipping the first N_SKIP
-print(f"Searching for tissue tile (skipping first {N_SKIP})...")
-anchor, count = None, 0
-for tile, _ in iter_tiles(reader, min_tissue_fraction=0.1):
-    if count >= N_SKIP:
-        anchor = tile
+tiles, grid = [], None
+for tile, g in iter_tiles(reader, min_tissue_fraction=0.05):
+    tiles.append(tile)
+    grid = g
+    if len(tiles) >= N_TILES:
         break
-    count += 1
-
-if anchor is None:
-    # Fewer than N_SKIP tissue tiles — just use the first one
-    for tile, _ in iter_tiles(reader, min_tissue_fraction=0.1):
-        anchor = tile
-        break
-
-if anchor is None:
-    reader.close()
-    sys.exit("No tissue tiles found.")
-
-print(f"Anchor tile: row={anchor.row}, col={anchor.col}")
-
-# ---------------------------------------------------------------------------
-# Build the read-level bounding box for PATCH_TILES × PATCH_TILES tiles.
-#
-# PATCH_TILES * TILE_SIZE is the desired size at *target* 20x resolution.
-# At the read level we need rd times as many pixels before rescaling.
-# We center the patch around the anchor tile so we don't fall off an edge.
-# ---------------------------------------------------------------------------
-
-target_px  = PATCH_TILES * TILE_SIZE          # desired pixels at 20x
-read_px    = round(target_px * rd)            # pixels needed at the read level
-
-# Anchor tile top-left in read-level pixels
-ax = anchor.col * TILE_SIZE
-ay = anchor.row * TILE_SIZE
-
-# Center the patch around the anchor tile (anchor is at the top-left of the tile)
-x_read = ax - read_px // 2 + TILE_SIZE // 2
-y_read = ay - read_px // 2 + TILE_SIZE // 2
-
-# Clamp so we stay within slide bounds
-x_read = max(0, min(x_read, slide_w - read_px))
-y_read = max(0, min(y_read, slide_h - read_px))
-
-read_w = min(read_px, slide_w - x_read)
-read_h = min(read_px, slide_h - y_read)
-
-x0 = int(x_read * level_ds)
-y0 = int(y_read * level_ds)
-
-print(f"Reading {read_w}×{read_h} px at read level from level-0 ({x0}, {y0})...")
-region = reader.read_region(x0, y0, read_w, read_h)
 reader.close()
 
-# Rescale the whole patch to target 20x resolution in one shot
-if abs(rd - 1.0) > 1e-3:
-    target_w = round(read_w / rd)
-    target_h = round(read_h / rd)
-    print(f"Rescaling {read_w}×{read_h} → {target_w}×{target_h} px")
-    region = np.array(Image.fromarray(region).resize((target_w, target_h), Image.Resampling.LANCZOS))
-
-# Pad to exact target_px × target_px (dimensions must be divisible by 16)
-he = np.full((target_px, target_px, 3), 255, dtype=np.uint8)
-rh, rw = min(region.shape[0], target_px), min(region.shape[1], target_px)
-he[:rh, :rw] = region[:rh, :rw]
-
-print(f"H&E patch: {he.shape[1]}×{he.shape[0]} px — loading model...")
+print(f"  {len(tiles)} tiles  |  slide {grid.slide_width}×{grid.slide_height} px (target-MPP space)")
 
 # ---------------------------------------------------------------------------
-# Run model on the whole patch at once (sliding window handles sub-tiles)
+# Build canvas — identical logic to _update() in extract_features_tcga_luad.py
 # ---------------------------------------------------------------------------
 
+slide_max = max(grid.slide_width, grid.slide_height)
+scale     = MAP_SIZE / slide_max
+canvas_h  = max(1, int(grid.slide_height * scale))
+canvas_w  = max(1, int(grid.slide_width  * scale))
+canvas    = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+
+print("Loading model...")
 model = load_model(device=DEVICE)
 model.eval()
 
+step = grid.tile_size - grid.overlap
+
+print("Running inference and projecting onto canvas...")
 with torch.inference_mode():
-    preds = predict(he, model, device=DEVICE, return_probabilities=True)
+    for i in range(0, len(tiles), BATCH_SIZE):
+        batch = tiles[i : i + BATCH_SIZE]
+        for t, preds in zip(batch, predict_batch([t.array for t in batch], model, device=DEVICE)):
+            y0 = t.row * step
+            x0 = t.col * step
+            y1 = min(y0 + grid.tile_size, grid.slide_height)
+            x1 = min(x0 + grid.tile_size, grid.slide_width)
 
-dapi = preds["probabilities"][..., 0]   # float32 (H, W)
-print(f"DAPI — min: {dapi.min():.3f}  mean: {dapi.mean():.3f}  max: {dapi.max():.3f}")
+            y0_c = int(y0 * scale)
+            x0_c = int(x0 * scale)
+            y1_c = int(y1 * scale)
+            x1_c = int(x1 * scale)
+            if y1_c > y0_c and x1_c > x0_c:
+                patch = np.array(
+                    Image.fromarray((preds["DAPI"] * 255).astype(np.uint8)).resize(
+                        (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
+                    )
+                )
+                canvas[y0_c:y1_c, x0_c:x1_c] = np.maximum(
+                    canvas[y0_c:y1_c, x0_c:x1_c], patch
+                )
 
 # ---------------------------------------------------------------------------
-# Save side-by-side: H&E | DAPI
+# Percentile-clip + colorize (same as save loop in extraction script)
 # ---------------------------------------------------------------------------
 
-dapi_u8  = (dapi * 255).astype(np.uint8)
-r, g, b  = DAPI_COLOR
-dapi_rgb = np.stack([
-    (dapi_u8.astype(np.uint16) * r // 255).astype(np.uint8),
-    (dapi_u8.astype(np.uint16) * g // 255).astype(np.uint8),
-    (dapi_u8.astype(np.uint16) * b // 255).astype(np.uint8),
+arr  = canvas
+p995 = np.percentile(arr[arr > 0], 99.5) if (arr > 0).any() else 1.0
+arr  = np.clip(arr, 0, p995)
+arr  = (arr * 255.0 / p995).astype(np.uint8)
+
+r, g, b = DAPI_COLOR
+a = arr.astype(np.uint16)
+rgb = np.stack([
+    (a * r // 255).astype(np.uint8),
+    (a * g // 255).astype(np.uint8),
+    (a * b // 255).astype(np.uint8),
 ], axis=-1)
 
-combined = np.hstack([he, dapi_rgb])
-out_path = "test_fullres_patch.png"
-Image.fromarray(combined).save(out_path)
-print(f"\nSaved {out_path}  ({combined.shape[1]}×{combined.shape[0]} px)")
-print("Left = H&E  |  Right = DAPI probability (raw sigmoid, cornflower blue)")
+out = "test_dapi_canvas.png"
+Image.fromarray(rgb, mode="RGB").save(out)
+print(f"\nSaved {out}  ({canvas_w}×{canvas_h} px canvas, {len(tiles)} tiles projected)")

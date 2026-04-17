@@ -14,6 +14,8 @@ dependencies = [
     "boto3>=1.34",
     "owkin-abstra>=1.8.1",
     "owkin-sagemaker-toolbox",
+    "owkin-tilingtoolv2>=11.16.1",
+    "classic-algos",
 ]
 
 [project.optional-dependencies]
@@ -54,6 +56,8 @@ explicit = true
 [tool.uv.sources]
 owkin-sagemaker-toolbox = { index = "codeartifact" }
 owkin-abstra = { index = "codeartifact" }
+owkin-tilingtoolv2 = { index = "codeartifact" }
+classic-algos = { index = "codeartifact" }
 
 [project.scripts]
 gigatime-infer = "gigatime.cli:main"

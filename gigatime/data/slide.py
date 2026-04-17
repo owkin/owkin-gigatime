@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 import tempfile
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import openslide
+from openslide.deepzoom import DeepZoomGenerator
+from tilingtool.exceptions import MPPNotAvailableError
+from tilingtool.utils.slide import (
+    RobustOpenSlide,
+    get_level_raw_mpp_mapping,
+    get_slide_resolution,
+    get_tiling_slide_level,
+)
 
 # Target microns-per-pixel the model was trained at (~20x)
 TARGET_MPP = 0.5
+# Warn (but don't crash) if the closest DZ level deviates from TARGET_MPP by
+# more than this fraction.
+_MPP_RTOL = 0.2
 
 
 @dataclass(frozen=True)
@@ -28,11 +39,17 @@ class SlideMetadata:
 class SlideReader:
     """Thin wrapper around an OpenSlide object.
 
-    Automatically selects the best level to read from so that the effective
-    resolution matches the model's training resolution (~0.5 µm/px, 20x).
+    Uses :func:`tilingtool.utils.slide.get_tiling_slide_level` with a
+    :class:`openslide.deepzoom.DeepZoomGenerator` to select the zoom level
+    whose effective resolution is closest to TARGET_MPP (0.5 µm/px, ~20x),
+    regardless of the native pyramid layout.
+
+    The underlying slide is opened via :class:`tilingtool.utils.slide.RobustOpenSlide`
+    which retries reads at a lower level on ``OpenSlideError``, useful for old
+    or partially-corrupt TCGA files.
 
     Args:
-        path: Local path to the WSI file.
+        path: Local path or S3 URI to the WSI file.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -44,9 +61,10 @@ class SlideReader:
             self._tmp_dir = tempfile.TemporaryDirectory()
             path = str(download_slide(path, dest_dir=self._tmp_dir.name))
         self.path = Path(path)
-        self._slide = openslide.OpenSlide(str(self.path))
+        self._slide = RobustOpenSlide(str(self.path))
         self.metadata = self._read_metadata()
-        self.read_level, self.read_downsample = self._select_read_level()
+        self._dz = DeepZoomGenerator(self._slide, tile_size=512, overlap=0, limit_bounds=False)
+        self.dz_level = self._select_dz_level()
 
     def __enter__(self) -> SlideReader:
         return self
@@ -66,36 +84,18 @@ class SlideReader:
 
     @property
     def dimensions_at_read_level(self) -> tuple[int, int]:
-        """(width, height) of the slide at the selected read level."""
-        return self._slide.level_dimensions[self.read_level]
-
-    def read_region(self, x: int, y: int, width: int, height: int) -> np.ndarray:
-        """Read a region at the selected level.
-
-        Args:
-            x: Left edge in level-0 pixel coordinates.
-            y: Top edge in level-0 pixel coordinates.
-            width: Region width in pixels at the read level.
-            height: Region height in pixels at the read level.
-
-        Returns:
-            uint8 RGB array of shape (height, width, 3).
-        """
-        region = self._slide.read_region(
-            location=(x, y),
-            level=self.read_level,
-            size=(width, height),
-        )
-        return np.array(region.convert("RGB"))
+        """(width, height) in pixels at the selected DZ level."""
+        return self._dz.level_dimensions[self.dz_level]
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _read_metadata(self) -> SlideMetadata:
-        props = self._slide.properties
-        raw_mpp = props.get(openslide.PROPERTY_NAME_MPP_X)
-        mpp = float(raw_mpp) if raw_mpp is not None else float("nan")
+        try:
+            mpp = get_slide_resolution(self._slide)
+        except KeyError:
+            mpp = float("nan")
         return SlideMetadata(
             path=self.path,
             width=self._slide.dimensions[0],
@@ -104,27 +104,26 @@ class SlideReader:
             level_count=self._slide.level_count,
             level_dimensions=tuple(self._slide.level_dimensions),
             level_downsamples=tuple(self._slide.level_downsamples),
-            vendor=props.get(openslide.PROPERTY_NAME_VENDOR),
+            vendor=self._slide.properties.get(openslide.PROPERTY_NAME_VENDOR),
         )
 
-    def _select_read_level(self) -> tuple[int, float]:
-        """Return the (level_index, effective_downsample) closest to TARGET_MPP."""
-        mpp = self.metadata.mpp
-        if np.isnan(mpp):
-            # No MPP metadata — fall back to level 0 and warn
-            import warnings
+    def _select_dz_level(self) -> int:
+        """Return the DZ level index whose MPP is closest to TARGET_MPP.
 
-            warnings.warn(
-                f"No MPP metadata found in {self.path.name}. "
-                "Falling back to level 0. Verify that the slide is at ~20x (0.5 µm/px).",
-                UserWarning,
-                stacklevel=3,
+        Delegates to :func:`tilingtool.utils.slide.get_tiling_slide_level`.
+        If no level falls within ``_MPP_RTOL`` of TARGET_MPP, emits a warning
+        and falls back to the closest available level rather than crashing.
+        """
+        try:
+            return get_tiling_slide_level(
+                self._slide,
+                self._dz,
+                mpp=TARGET_MPP,
+                default_mpp_max=0.25,
+                mpp_rtol=_MPP_RTOL,
             )
-            return 0, 1.0
-
-        target_downsample = TARGET_MPP / mpp
-        best_level = self._slide.get_best_level_for_downsample(target_downsample)
-        level_ds = self._slide.level_downsamples[best_level]
-        # Residual rescaling needed after reading at best_level
-        effective_downsample = target_downsample / level_ds
-        return best_level, effective_downsample
+        except MPPNotAvailableError as exc:
+            warnings.warn(str(exc), UserWarning, stacklevel=3)
+            # Tolerance exceeded — still pick the closest level rather than crashing.
+            mapping = get_level_raw_mpp_mapping(self._slide, self._dz, default_mpp_max=0.25)
+            return min(mapping, key=lambda lvl: abs(mapping[lvl] - TARGET_MPP))
