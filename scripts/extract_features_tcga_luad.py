@@ -30,12 +30,11 @@ Options
 Output
 ------
     OUTPUT_DIR/
-        <slide_stem>.json             — per-slide features + per-channel means + metadata
-        maps/<slide_stem>/<ch>.png    — per-channel spatial map (mIF colors, black background)
-        worker_<rank>.log             — per-worker log with timestamps
-        extract_features.log          — coordinator log
-        features.parquet              — merged table (written after all workers finish)
-        features.csv                  — same, CSV copy
+        slide-level-features/<slide_stem>.json   — per-slide features + metadata
+        maps/<slide_stem>/<ch>.png               — per-channel spatial map (mIF colors)
+        worker_<rank>.log                        — per-worker log with timestamps
+        extract_features.log                     — coordinator log
+        gigatime_tcga_luad.parquet               — merged table, refreshed every 50 slides
 """
 
 from __future__ import annotations
@@ -66,40 +65,52 @@ from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 
+# Regenerate the merged parquet after every this many newly completed slides.
+MERGE_EVERY = 50
+
 # Per-channel mIF display colors (RGB). Black background, signal in channel color.
 # Conventions follow standard multiplex immunofluorescence panel assignments.
 CHANNEL_COLORS: dict[str, tuple[int, int, int]] = {
-    "DAPI":        (100, 149, 237),  # cornflower blue  — nuclei
-    "CK":          (255, 255,   0),  # yellow           — tumour cells
-    "CD3":         ( 50, 205,  50),  # lime green       — pan T-cells
-    "CD8":         (  0, 255, 255),  # cyan             — cytotoxic T-cells
-    "CD4":         (144, 238, 144),  # light green      — helper T-cells
-    "CD68":        (255, 165,   0),  # orange           — macrophages
-    "PD-L1":       (255,   0,   0),  # red              — immune checkpoint (tumour)
-    "PD-1":        (255,   0, 255),  # magenta          — exhaustion / activation
-    "CD20":        (255, 215,   0),  # gold             — B-cells
-    "Ki67":        (255, 100,   0),  # orange-red       — proliferation
-    "CD34":        (220,  20,  60),  # crimson          — vasculature
-    "CD138":       (148,   0, 211),  # violet           — plasma cells
-    "CD11c":       (255, 200,   0),  # amber            — dendritic cells
-    "CD14":        (210, 105,  30),  # chocolate        — monocytes
-    "CD16":        (189, 183, 107),  # dark khaki       — NK cells / neutrophils
-    "T-bet":       (  0, 191, 255),  # deep sky blue    — Th1 / CD8 transcription factor
-    "Tryptase":    (186,  85, 211),  # medium orchid    — mast cells
-    "Actin-D":     (169, 169, 169),  # dark grey        — smooth muscle / myofibroblasts
-    "Caspase3-D":  (127, 255,   0),  # chartreuse       — apoptosis
-    "PHH3-B":      (255, 255, 102),  # pale yellow      — mitosis
-    "Transgelin":  (119, 136, 153),  # light slate grey — smooth muscle actin
+    "DAPI": (100, 149, 237),  # cornflower blue  — nuclei
+    "CK": (255, 255, 0),  # yellow           — tumour cells
+    "CD3": (50, 205, 50),  # lime green       — pan T-cells
+    "CD8": (0, 255, 255),  # cyan             — cytotoxic T-cells
+    "CD4": (144, 238, 144),  # light green      — helper T-cells
+    "CD68": (255, 165, 0),  # orange           — macrophages
+    "PD-L1": (255, 0, 0),  # red              — immune checkpoint (tumour)
+    "PD-1": (255, 0, 255),  # magenta          — exhaustion / activation
+    "CD20": (255, 215, 0),  # gold             — B-cells
+    "Ki67": (255, 100, 0),  # orange-red       — proliferation
+    "CD34": (220, 20, 60),  # crimson          — vasculature
+    "CD138": (148, 0, 211),  # violet           — plasma cells
+    "CD11c": (255, 200, 0),  # amber            — dendritic cells
+    "CD14": (210, 105, 30),  # chocolate        — monocytes
+    "CD16": (189, 183, 107),  # dark khaki       — NK cells / neutrophils
+    "T-bet": (0, 191, 255),  # deep sky blue    — Th1 / CD8 transcription factor
+    "Tryptase": (186, 85, 211),  # medium orchid    — mast cells
+    "Actin-D": (169, 169, 169),  # dark grey        — smooth muscle / myofibroblasts
+    "Caspase3-D": (127, 255, 0),  # chartreuse       — apoptosis
+    "PHH3-B": (255, 255, 102),  # pale yellow      — mitosis
+    "Transgelin": (119, 136, 153),  # light slate grey — smooth muscle actin
 }
 
 FEATURE_CHANNELS = [
-    "CK", "DAPI", "CD8", "CD4", "CD68", "CD34",
-    "PD-1", "PD-L1", "Ki67", "Caspase3-D",
+    "CK",
+    "DAPI",
+    "CD8",
+    "CD4",
+    "CD68",
+    "CD34",
+    "PD-1",
+    "PD-L1",
+    "Ki67",
+    "Caspase3-D",
 ]
 
 # ---------------------------------------------------------------------------
 # Tile prefetch helper
 # ---------------------------------------------------------------------------
+
 
 def _prefetch_tiles(reader, min_tissue_fraction: float, maxsize: int):
     """Yield (tile, grid) pairs — iter_tiles runs in a background thread."""
@@ -124,6 +135,7 @@ def _prefetch_tiles(reader, min_tissue_fraction: float, maxsize: int):
 # ---------------------------------------------------------------------------
 # Per-slide processing
 # ---------------------------------------------------------------------------
+
 
 def _process_slide(
     uri: str,
@@ -193,21 +205,27 @@ def _process_slide(
                     scale = map_size / slide_max
                     canvas_h = max(1, int(grid.slide_height * scale))
                     canvas_w = max(1, int(grid.slide_width * scale))
-                    canvas.update({
-                        ch: np.zeros((canvas_h, canvas_w), dtype=np.uint8)
-                        for ch in ANALYSIS_CHANNELS
-                    })
+                    canvas.update(
+                        {
+                            ch: np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+                            for ch in ANALYSIS_CHANNELS
+                        }
+                    )
                 buf.append(tile)
                 n_tiles += 1
                 if len(buf) < batch_size:
                     continue
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+                for t, preds in zip(
+                    buf, predict_batch([t.array for t in buf], model, device=device)
+                ):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
                 buf.clear()
 
             if buf:
-                for t, preds in zip(buf, predict_batch([t.array for t in buf], model, device=device)):
+                for t, preds in zip(
+                    buf, predict_batch([t.array for t in buf], model, device=device)
+                ):
                     acc.update({ch: preds[ch] for ch in FEATURE_CHANNELS}, t)
                     _update(preds, t)
     finally:
@@ -224,18 +242,18 @@ def _process_slide(
         arr = (arr * 255.0 / p995).astype(np.uint8)
         r, g, b = CHANNEL_COLORS.get(ch, (255, 255, 255))
         a = arr.astype(np.uint16)
-        rgb = np.stack([
-            (a * r // 255).astype(np.uint8),
-            (a * g // 255).astype(np.uint8),
-            (a * b // 255).astype(np.uint8),
-        ], axis=-1)
+        rgb = np.stack(
+            [
+                (a * r // 255).astype(np.uint8),
+                (a * g // 255).astype(np.uint8),
+                (a * b // 255).astype(np.uint8),
+            ],
+            axis=-1,
+        )
         Image.fromarray(rgb, mode="RGB").save(maps_dir / f"{ch}.png")
 
     # Per-channel mean expression over tissue.
-    channels = {
-        ch: ch_sums[ch] / tissue_px if tissue_px > 0 else 0.0
-        for ch in ANALYSIS_CHANNELS
-    }
+    channels = {ch: ch_sums[ch] / tissue_px if tissue_px > 0 else 0.0 for ch in ANALYSIS_CHANNELS}
 
     elapsed = time.perf_counter() - t0
 
@@ -254,8 +272,49 @@ def _process_slide(
 
 
 # ---------------------------------------------------------------------------
+# Parquet merge
+# ---------------------------------------------------------------------------
+
+
+def _merge_results(output_dir: Path, log: logging.Logger) -> None:
+    """Merge all per-slide JSONs into gigatime_tcga_luad.parquet (atomic write)."""
+    features_dir = output_dir / "slide-level-features"
+    json_files = sorted(features_dir.glob("*.json"))
+    if not json_files:
+        log.info("No JSON files to merge.")
+        return
+
+    try:
+        import pandas as pd
+    except ImportError:
+        log.warning("pandas not available — skipping merge. pip install pandas pyarrow")
+        return
+
+    rows = []
+    for p in json_files:
+        try:
+            data = json.loads(p.read_text())
+            row = {"slide": p.stem}
+            row.update(data.get("metadata", {}))
+            row.update(data.get("features", {}))
+            row.update(data.get("channels", {}))
+            row["elapsed_s"] = data.get("elapsed_s")
+            rows.append(row)
+        except Exception as exc:
+            log.warning(f"Could not parse {p.name}: {exc}")
+
+    df = pd.DataFrame(rows)
+    parquet_path = output_dir / "gigatime_tcga_luad.parquet"
+    tmp_path = parquet_path.with_suffix(".parquet.tmp")
+    df.to_parquet(tmp_path, index=False)
+    tmp_path.rename(parquet_path)
+    log.info(f"Merged {len(df)} slides → {parquet_path}")
+
+
+# ---------------------------------------------------------------------------
 # Worker (one per GPU)
 # ---------------------------------------------------------------------------
+
 
 def _worker(
     rank: int,
@@ -288,6 +347,7 @@ def _worker(
     model.eval()
     log.info("Model ready.")
 
+    features_dir = output_dir / "slide-level-features"
     maps_root = output_dir / "maps"
     my_slides = pending[rank::num_workers]
     errors: list[tuple[str, str]] = []
@@ -296,7 +356,7 @@ def _worker(
     for idx, uri in enumerate(tqdm(my_slides, desc=f"GPU{rank}", position=rank, leave=True)):
         name = Path(uri).name
         stem = Path(uri).stem
-        out_path = output_dir / f"{stem}.json"
+        out_path = features_dir / f"{stem}.json"
 
         if out_path.exists():
             log.info(f"  SKIP (done)  {name}")
@@ -306,7 +366,11 @@ def _worker(
 
         try:
             result = _process_slide(
-                uri, model, device, batch_size, prefetch,
+                uri,
+                model,
+                device,
+                batch_size,
+                prefetch,
                 maps_dir=maps_root / stem,
                 map_size=map_size,
             )
@@ -327,6 +391,13 @@ def _worker(
             f"{elapsed:.1f}s  ({tiles_per_sec:.1f} tiles/s)  → {out_path.name}"
         )
 
+        # Regenerate the merged parquet every MERGE_EVERY completed slides
+        # (counted across all workers via the total JSON count on disk).
+        n_done = sum(1 for _ in features_dir.glob("*.json"))
+        if n_done % MERGE_EVERY == 0:
+            log.info(f"  {n_done} slides done — refreshing parquet…")
+            _merge_results(output_dir, log)
+
     log.info(f"Worker {rank} done: {len(slide_times)} ok, {len(errors)} errors.")
     if errors:
         for name, msg in errors:
@@ -337,6 +408,7 @@ def _worker(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     n_gpus = torch.cuda.device_count()
     default_workers = max(1, n_gpus)
@@ -345,7 +417,9 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/home/sagemaker-user/custom-file-systems/efs/fs-09913c1f7db79b6fd/gigatime_tcga_luad/outputs"),
+        default=Path(
+            "/home/sagemaker-user/custom-file-systems/efs/fs-09913c1f7db79b6fd/gigatime_tcga_luad/outputs"
+        ),
     )
     parser.add_argument(
         "--num-workers",
@@ -381,6 +455,7 @@ def main() -> None:
 
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "slide-level-features").mkdir(exist_ok=True)
 
     # Keep downloaded slides and the HuggingFace model cache beside the output
     # directory. os.environ is used so spawned worker processes inherit both.
@@ -414,18 +489,15 @@ def main() -> None:
     manifest = Manifest().load()
     dataset = manifest.datasets[TCGA_LUAD]
     all_slides = [
-        s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
-        if "parafine" in s
+        s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s
     ]
     if args.limit is not None:
         all_slides = all_slides[: args.limit]
 
     log.info(f"Total slides     : {len(all_slides)}")
 
-    pending = [
-        uri for uri in all_slides
-        if not (output_dir / f"{Path(uri).stem}.json").exists()
-    ]
+    features_dir = output_dir / "slide-level-features"
+    pending = [uri for uri in all_slides if not (features_dir / f"{Path(uri).stem}.json").exists()]
     log.info(f"Slides to process: {len(pending)}  (skipping {len(all_slides) - len(pending)} done)")
 
     if not pending:
@@ -435,7 +507,14 @@ def main() -> None:
 
     wall_start = time.perf_counter()
 
-    worker_args = (pending, output_dir, args.num_workers, args.batch_size, args.prefetch, args.map_size)
+    worker_args = (
+        pending,
+        output_dir,
+        args.num_workers,
+        args.batch_size,
+        args.prefetch,
+        args.map_size,
+    )
 
     if args.num_workers == 1:
         _worker(0, *worker_args)
@@ -451,40 +530,6 @@ def main() -> None:
     log.info(f"All workers finished — wall time {total_wall / 60:.1f} min")
 
     _merge_results(output_dir, log)
-
-
-def _merge_results(output_dir: Path, log: logging.Logger) -> None:
-    """Merge all per-slide JSONs into a single parquet + CSV."""
-    json_files = sorted(output_dir.glob("*.json"))
-    if not json_files:
-        log.info("No JSON files to merge.")
-        return
-
-    try:
-        import pandas as pd
-    except ImportError:
-        log.warning("pandas not available — skipping merge. pip install pandas pyarrow")
-        return
-
-    rows = []
-    for p in json_files:
-        try:
-            data = json.loads(p.read_text())
-            row = {"slide": p.stem}
-            row.update(data.get("metadata", {}))
-            row.update(data.get("features", {}))
-            row.update(data.get("channels", {}))
-            row["elapsed_s"] = data.get("elapsed_s")
-            rows.append(row)
-        except Exception as exc:
-            log.warning(f"Could not parse {p.name}: {exc}")
-
-    df = pd.DataFrame(rows)
-    parquet_path = output_dir / "features.parquet"
-    csv_path = output_dir / "features.csv"
-    df.to_parquet(parquet_path, index=False)
-    df.to_csv(csv_path, index=False)
-    log.info(f"Merged {len(df)} slides → {parquet_path}  and  {csv_path}")
 
 
 if __name__ == "__main__":

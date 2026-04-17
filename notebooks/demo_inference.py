@@ -9,9 +9,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import openslide
 import torch
 from abstra.manifest import Manifest
+from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 
 from tqdm import tqdm
@@ -24,7 +24,40 @@ from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 
-BATCH_SIZE = 8  # increase if GPU memory allows
+# Traditional mIF fluorophore colors (black → channel color colormaps)
+MIF_COLORS: dict[str, tuple[int, int, int]] = {
+    "DAPI":       (100, 149, 237),  # cornflower blue
+    "TRITC":      (255, 100,   0),  # orange (background channel)
+    "Cy5":        (200,   0, 200),  # magenta (background channel)
+    "PD-1":       (255,  80,   0),  # orange-red
+    "CD14":       (255, 200,   0),  # yellow
+    "CD4":        (  0, 200,  80),  # green
+    "T-bet":      (180,   0, 255),  # violet
+    "CD34":       (255, 150, 200),  # pink
+    "CD68":       (255,  30,  30),  # red
+    "CD16":       (255, 140,   0),  # dark orange
+    "CD11c":      (150, 255,   0),  # lime
+    "CD138":      (255,   0, 180),  # magenta-pink
+    "CD20":       (  0, 200, 255),  # sky blue
+    "CD3":        (255, 230,   0),  # yellow
+    "CD8":        (  0, 255, 200),  # turquoise
+    "PD-L1":      (220,   0,   0),  # red
+    "CK":         (255, 255,   0),  # yellow (cytokeratin)
+    "Ki67":       (255,   0, 150),  # hot pink
+    "Tryptase":   (128,   0, 255),  # purple
+    "Actin-D":    (255, 180, 100),  # peach
+    "Caspase3-D": (255,  50,  50),  # light red
+    "PHH3-B":     ( 80,  80, 255),  # blue-violet
+    "Transgelin": (  0, 200, 180),  # teal
+}
+
+
+def _mif_cmap(channel: str) -> LinearSegmentedColormap:
+    """Black-to-color colormap for a given mIF channel."""
+    r, g, b = MIF_COLORS.get(channel, (255, 255, 255))
+    return LinearSegmentedColormap.from_list(channel, ["black", (r / 255, g / 255, b / 255)])
+
+BATCH_SIZE = 16  # increase if GPU memory allows
 CHANNELS_TO_DISPLAY = ["CD8", "CD3", "PD-1", "PD-L1", "CK", "CD4"]
 ANALYSIS_CHANNELS = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 N_SAMPLE_TILES = 3
@@ -34,7 +67,7 @@ ALL_CANVAS_MAX_DIM = 1024
 # %%
 # --- Choose dataset ---
 AVAILABLE_DATASETS = [TCGA_LUAD, MOSAIC_BLCA, MOSAIC_OV]
-DATASET = AVAILABLE_DATASETS[1]  # change key to switch datasets
+DATASET = AVAILABLE_DATASETS[0]  # change key to switch datasets
 
 manifest = Manifest().load()
 dataset = manifest.datasets[DATASET]
@@ -54,7 +87,7 @@ print(f"Loaded — {len(CHANNEL_NAMES)} output channels: {', '.join(CHANNEL_NAME
 
 # %%
 # Run the inference on one image
-SLIDE_INDEX = 0
+SLIDE_INDEX = 2
 slide_uri = slides[SLIDE_INDEX]
 print(f"Opening: {Path(slide_uri).name}")
 reader = SlideReader(slide_uri)  # S3 URI — downloaded to a temp dir, cleaned up on close()
@@ -139,17 +172,15 @@ with torch.inference_mode():
         for t, preds in zip(tile_buf, predict_batch([t.array for t in tile_buf], model, device=DEVICE)):
             _process_tile(t, preds, grid, step)
 
-reader.close()
 assert grid is not None, "No tissue tiles found — check min_tissue_fraction or slide content"
 print(f"Done: {n_tiles} tissue tiles across a {grid.n_rows}×{grid.n_cols} grid")
 
 # %%
 # Display tile level inferences
 # Build H&E thumbnail from the native pyramid (fast, no re-reading)
-raw_slide = openslide.OpenSlide(str(reader.path))
 thumb_w, thumb_h = 512, 512
-thumbnail = np.array(raw_slide.get_thumbnail((thumb_w, thumb_h)).convert("RGB"))
-raw_slide.close()
+thumbnail = np.array(reader._slide.get_thumbnail((thumb_w, thumb_h)).convert("RGB"))
+reader.close()
 
 n = len(CHANNELS_TO_DISPLAY)
 fig, axes = plt.subplots(2, (n // 2) + 1, figsize=(4 * ((n // 2) + 1), 8))
@@ -162,12 +193,13 @@ axes[0].axis("off")
 
 # Channel panels — vis_canvas is already downsampled, resize only to match thumbnail
 for ax, channel in zip(axes[1:], CHANNELS_TO_DISPLAY):
-    disp = np.array(
-        Image.fromarray((vis_canvas[channel] * 255).astype(np.uint8)).resize(
-            (thumb_w, thumb_h), Image.NEAREST
-        )
-    )
-    ax.imshow(disp, cmap="hot", vmin=0, vmax=255)
+    arr = vis_canvas[channel]
+    p999 = np.percentile(arr[arr > 0], 99.9) if (arr > 0).any() else 1.0
+    arr = np.clip(arr, 0, p999) / p999
+    disp = np.array(Image.fromarray((arr * 255).astype(np.uint8)).resize(
+        (thumb_w, thumb_h), Image.NEAREST
+    ))
+    ax.imshow(disp, cmap=_mif_cmap(channel), vmin=0, vmax=255)
     ax.set_title(channel, fontsize=12)
     ax.axis("off")
 
@@ -176,6 +208,28 @@ for ax in axes[1 + n :]:
     ax.set_visible(False)
 
 fig.suptitle(f"GigaTIME predictions — {reader.path.name}", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+# %%
+# DAPI channel histogram
+dapi_arr = vis_canvas["DAPI"]
+dapi_nonzero = dapi_arr[dapi_arr > 0]
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.hist(dapi_nonzero.ravel(), bins=100, color=(100 / 255, 149 / 255, 237 / 255), edgecolor="none")
+p999_dapi = np.percentile(dapi_nonzero, 99.9) if dapi_nonzero.size > 0 else 1.0
+ax.axvline(p999_dapi, color="white", linestyle="--", linewidth=1.2, label=f"99.9th pct = {p999_dapi:.3f}")
+ax.set_facecolor("black")
+fig.patch.set_facecolor("#111111")
+ax.tick_params(colors="white")
+ax.xaxis.label.set_color("white")
+ax.yaxis.label.set_color("white")
+ax.title.set_color("white")
+ax.spines[:].set_color("#444444")
+ax.set_xlabel("Probability")
+ax.set_ylabel("Pixel count")
+ax.set_title("DAPI — pixel intensity distribution (tissue tiles only)")
+ax.legend(facecolor="#222222", labelcolor="white", framealpha=0.8)
 plt.tight_layout()
 plt.show()
 
@@ -202,7 +256,7 @@ for row, (he_array, tile_preds) in enumerate(sampled_tiles):
     if row == 0:
         axes[row, 0].set_title("H&E", fontsize=10, fontweight="bold")
     for col, ch in enumerate(CHANNELS_TO_DISPLAY, start=1):
-        axes[row, col].imshow(tile_preds[ch], cmap="hot", vmin=0, vmax=1)
+        axes[row, col].imshow(tile_preds[ch], cmap=_mif_cmap(ch), vmin=0, vmax=1)
         axes[row, col].axis("off")
         if row == 0:
             axes[row, col].set_title(ch, fontsize=10)
@@ -218,10 +272,11 @@ n_rows_grid = (n_ch + n_cols_grid - 1) // n_cols_grid
 fig, axes = plt.subplots(n_rows_grid, n_cols_grid, figsize=(3.5 * n_cols_grid, 3.5 * n_rows_grid))
 axes = axes.flatten()
 for i, ch in enumerate(ANALYSIS_CHANNELS):
-    disp = np.array(
-        Image.fromarray((all_canvas[ch] * 255).astype(np.uint8)).resize((512, 512), Image.NEAREST)
-    )
-    axes[i].imshow(disp, cmap="hot", vmin=0, vmax=255)
+    arr = all_canvas[ch]
+    p999 = np.percentile(arr[arr > 0], 99.9) if (arr > 0).any() else 1.0
+    arr = np.clip(arr, 0, p999) / p999
+    disp = np.array(Image.fromarray((arr * 255).astype(np.uint8)).resize((512, 512), Image.NEAREST))
+    axes[i].imshow(disp, cmap=_mif_cmap(ch), vmin=0, vmax=255)
     axes[i].set_title(ch, fontsize=10)
     axes[i].axis("off")
 for ax in axes[n_ch:]:

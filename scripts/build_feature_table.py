@@ -52,9 +52,14 @@ def build_table(input_dir: Path) -> None:
         metadata = data.get("metadata", {})
 
         required = {
-            "pdl1_tps", "cd8_intratumoral_density", "immune_exclusion_index",
-            "cd8_pd1_exhaustion_fraction", "macrophage_to_tcell_ratio",
-            "ki67_tpi", "apoptosis_index", "vascular_density_intratumoral",
+            "pdl1_tps",
+            "cd8_intratumoral_density",
+            "immune_exclusion_index",
+            "cd8_pd1_exhaustion_fraction",
+            "macrophage_to_tcell_ratio",
+            "ki67_tpi",
+            "apoptosis_index",
+            "vascular_density_intratumoral",
         }
         missing = required - features.keys()
         if missing:
@@ -65,11 +70,11 @@ def build_table(input_dir: Path) -> None:
         patient_id = "-".join(p.stem.split("-")[:3])
         row: dict = {"patient_id": patient_id, "slide": p.stem}
 
-        row["slide_width_px"]  = metadata.get("slide_width_px")
+        row["slide_width_px"] = metadata.get("slide_width_px")
         row["slide_height_px"] = metadata.get("slide_height_px")
-        row["n_tiles"]         = metadata.get("n_tiles")
-        row["processed_at"]    = metadata.get("processed_at", "")
-        row["elapsed_s"]       = data.get("elapsed_s")
+        row["n_tiles"] = metadata.get("n_tiles")
+        row["processed_at"] = metadata.get("processed_at", "")
+        row["elapsed_s"] = data.get("elapsed_s")
 
         row.update(features)
         row.update(data.get("channels", {}))
@@ -83,7 +88,7 @@ def build_table(input_dir: Path) -> None:
     df = pd.DataFrame(rows)
 
     parquet_path = input_dir / "features.parquet"
-    csv_path     = input_dir / "features.csv"
+    csv_path = input_dir / "features.csv"
     df.to_parquet(parquet_path, index=False)
     df.to_csv(csv_path, index=False)
 

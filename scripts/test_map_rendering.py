@@ -9,27 +9,28 @@ Output: test_dapi_canvas.png
 """
 
 import sys
-import torch
 from pathlib import Path
-from PIL import Image
-import numpy as np
 
+import numpy as np
+import torch
 from abstra.manifest import Manifest
+from PIL import Image
+
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import TCGA_LUAD
 from gigatime.inference import load_model, predict_batch
 
-DEVICE     = "cuda:0" if torch.cuda.is_available() else "cpu"
-N_TILES    = 300
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+N_TILES = 300
 BATCH_SIZE = 7
-MAP_SIZE   = 512
+MAP_SIZE = 512
 DAPI_COLOR = (100, 149, 237)
 
 # ---------------------------------------------------------------------------
 
 manifest = Manifest().load()
-dataset  = manifest.datasets[TCGA_LUAD]
-slides   = [s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s]
+dataset = manifest.datasets[TCGA_LUAD]
+slides = [s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s]
 if not slides:
     sys.exit("No slides found.")
 
@@ -49,17 +50,19 @@ for tile, g in iter_tiles(reader, min_tissue_fraction=0.05):
         break
 reader.close()
 
-print(f"  {len(tiles)} tiles  |  slide {grid.slide_width}×{grid.slide_height} px (target-MPP space)")
+print(
+    f"  {len(tiles)} tiles  |  slide {grid.slide_width}×{grid.slide_height} px (target-MPP space)"
+)
 
 # ---------------------------------------------------------------------------
 # Build canvas — identical logic to _update() in extract_features_tcga_luad.py
 # ---------------------------------------------------------------------------
 
 slide_max = max(grid.slide_width, grid.slide_height)
-scale     = MAP_SIZE / slide_max
-canvas_h  = max(1, int(grid.slide_height * scale))
-canvas_w  = max(1, int(grid.slide_width  * scale))
-canvas    = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
+scale = MAP_SIZE / slide_max
+canvas_h = max(1, int(grid.slide_height * scale))
+canvas_w = max(1, int(grid.slide_width * scale))
+canvas = np.zeros((canvas_h, canvas_w), dtype=np.uint8)
 
 print("Loading model...")
 model = load_model(device=DEVICE)
@@ -87,26 +90,27 @@ with torch.inference_mode():
                         (x1_c - x0_c, y1_c - y0_c), Image.NEAREST
                     )
                 )
-                canvas[y0_c:y1_c, x0_c:x1_c] = np.maximum(
-                    canvas[y0_c:y1_c, x0_c:x1_c], patch
-                )
+                canvas[y0_c:y1_c, x0_c:x1_c] = np.maximum(canvas[y0_c:y1_c, x0_c:x1_c], patch)
 
 # ---------------------------------------------------------------------------
 # Percentile-clip + colorize (same as save loop in extraction script)
 # ---------------------------------------------------------------------------
 
-arr  = canvas
+arr = canvas
 p995 = np.percentile(arr[arr > 0], 99.5) if (arr > 0).any() else 1.0
-arr  = np.clip(arr, 0, p995)
-arr  = (arr * 255.0 / p995).astype(np.uint8)
+arr = np.clip(arr, 0, p995)
+arr = (arr * 255.0 / p995).astype(np.uint8)
 
 r, g, b = DAPI_COLOR
 a = arr.astype(np.uint16)
-rgb = np.stack([
-    (a * r // 255).astype(np.uint8),
-    (a * g // 255).astype(np.uint8),
-    (a * b // 255).astype(np.uint8),
-], axis=-1)
+rgb = np.stack(
+    [
+        (a * r // 255).astype(np.uint8),
+        (a * g // 255).astype(np.uint8),
+        (a * b // 255).astype(np.uint8),
+    ],
+    axis=-1,
+)
 
 out = "test_dapi_canvas.png"
 Image.fromarray(rgb, mode="RGB").save(out)
