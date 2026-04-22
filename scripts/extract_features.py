@@ -1,4 +1,4 @@
-"""Extract GigaTIME spatial features for all TCGA-LUAD slides.
+"""Extract GigaTIME spatial features for a whole-slide image dataset.
 
 Designed for long-running tmux sessions. Saves one JSON + per-channel PNG maps
 per slide so that the script can be interrupted and restarted without
@@ -6,7 +6,7 @@ reprocessing completed slides.
 
 Multi-GPU usage (recommended)
 ------------------------------
-    python scripts/extract_features_tcga_luad.py
+    python scripts/extract_features_tcga_luad.py --dataset tcga-luad
 
     Each available GPU gets its own worker process. Slides are distributed
     round-robin. Workers write to the same output directory using atomic renames
@@ -14,18 +14,15 @@ Multi-GPU usage (recommended)
 
 Single-GPU / CPU
 -----------------
-    python scripts/extract_features_tcga_luad.py --num-workers 1 --device cuda:0
+    python scripts/extract_features_tcga_luad.py --dataset tcga-luad --num-workers 1
 
-Options
--------
-    --output-dir DIR      Where per-slide JSONs, PNG maps and logs go
-                          (default: EFS outputs directory)
-    --num-workers N       Worker processes to spawn (default: all available GPUs,
-                          or 1 on CPU-only machines)
-    --batch-size N        Tiles per forward pass per worker (default: 7)
-    --prefetch N          Tile read-ahead buffer per worker (default: 48)
-    --map-size N          Max dimension of per-channel PNG maps in pixels (default: 1024)
-    --limit N             Process at most N slides total (dry-run helper)
+Available datasets
+-------------------
+    tcga-luad           TCGA Lung Adenocarcinoma (parafine H&E)
+    mosaic-nsclc-uker   MOSAIC NSCLC UKER
+    mosaic-ov           MOSAIC Ovarian Cancer
+    mosaic-blca         MOSAIC Bladder Cancer
+    <uuid>              Any Abstra dataset hash directly
 
 Output
 ------
@@ -34,7 +31,7 @@ Output
         maps/<slide_stem>/<ch>.png               — per-channel spatial map (mIF colors)
         worker_<rank>.log                        — per-worker log with timestamps
         extract_features.log                     — coordinator log
-        gigatime_tcga_luad.parquet               — merged table, refreshed every 50 slides
+        gigatime_<dataset>.parquet               — merged feature table
 """
 
 from __future__ import annotations
@@ -57,16 +54,23 @@ from abstra.manifest import Manifest
 from PIL import Image
 from tqdm import tqdm
 
+from tilingtool.filters.matter_detection import BRUNet
+
 from gigatime.data import SlideReader, iter_tiles, list_slides
-from gigatime.data.paths import TCGA_LUAD
+from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_NSCLC_UKER, MOSAIC_OV, TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict_batch
 from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
 ANALYSIS_CHANNELS: list[str] = [ch for ch in CHANNEL_NAMES if ch not in BACKGROUND_CHANNELS]
 
-# Regenerate the merged parquet after every this many newly completed slides.
-MERGE_EVERY = 50
+# Named dataset presets: short name → (abstra hash, optional slide substring filter)
+DATASET_PRESETS: dict[str, tuple[str, str | None]] = {
+    "tcga-luad": (TCGA_LUAD, "parafine"),
+    "mosaic-nsclc-uker": (MOSAIC_NSCLC_UKER, None),
+    "mosaic-ov": (MOSAIC_OV, None),
+    "mosaic-blca": (MOSAIC_BLCA, None),
+}
 
 # Per-channel mIF display colors (RGB). Black background, signal in channel color.
 # Conventions follow standard multiplex immunofluorescence panel assignments.
@@ -112,24 +116,56 @@ FEATURE_CHANNELS = [
 # ---------------------------------------------------------------------------
 
 
-def _prefetch_tiles(reader, min_tissue_fraction: float, maxsize: int):
-    """Yield (tile, grid) pairs — iter_tiles runs in a background thread."""
+def _prefetch_tiles(
+    reader,
+    maxsize: int,
+    matter_mask: np.ndarray | None = None,
+    matter_threshold: float = 0.6,
+    min_tissue_fraction: float = 0.05,
+):
+    """Yield (tile, grid) pairs — iter_tiles runs in a background thread.
+
+    The thread is guaranteed to have exited (no outstanding OpenSlide reads)
+    before the generator returns, so callers can safely call reader.close()
+    immediately afterwards.
+    """
     q: queue.Queue = queue.Queue(maxsize=maxsize)
     _DONE = object()
+    stop = threading.Event()
 
     def _run() -> None:
         try:
-            for item in iter_tiles(reader, min_tissue_fraction=min_tissue_fraction):
+            for item in iter_tiles(
+                reader,
+                matter_mask=matter_mask,
+                matter_threshold=matter_threshold,
+                min_tissue_fraction=min_tissue_fraction,
+            ):
+                if stop.is_set():
+                    break
                 q.put(item)
         finally:
             q.put(_DONE)
 
-    threading.Thread(target=_run, daemon=True).start()
-    while True:
-        item = q.get()
-        if item is _DONE:
-            break
-        yield item
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = q.get()
+            if item is _DONE:
+                break
+            yield item
+    finally:
+        # Signal the thread to stop, then drain the queue so it is never
+        # blocked on q.put(), and wait for it to finish all OpenSlide I/O
+        # before returning — this makes reader.close() safe to call.
+        stop.set()
+        while thread.is_alive():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            thread.join(timeout=0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +176,7 @@ def _prefetch_tiles(reader, min_tissue_fraction: float, maxsize: int):
 def _process_slide(
     uri: str,
     model: torch.nn.Module,
+    matter_detector,
     device: str,
     batch_size: int,
     prefetch: int,
@@ -153,6 +190,10 @@ def _process_slide(
     """
     reader = SlideReader(uri)
     w, h = reader.dimensions_at_read_level
+
+    # Compute matter mask once per slide (runs at 4 MPP, very fast).
+    matter_mask = matter_detector(reader._slide)
+
 
     grid = None
     acc: SlideFeatureAccumulator | None = None
@@ -201,7 +242,7 @@ def _process_slide(
 
     try:
         with torch.inference_mode():
-            for tile, grid in _prefetch_tiles(reader, min_tissue_fraction=0.05, maxsize=prefetch):
+            for tile, grid in _prefetch_tiles(reader, maxsize=prefetch, matter_mask=matter_mask):
                 if acc is None:
                     acc = SlideFeatureAccumulator(grid)
                     slide_max = max(grid.slide_width, grid.slide_height)
@@ -286,8 +327,8 @@ def _process_slide(
 # ---------------------------------------------------------------------------
 
 
-def _merge_results(output_dir: Path, log: logging.Logger) -> None:
-    """Merge all per-slide JSONs into gigatime_tcga_luad.parquet (atomic write)."""
+def _merge_results(output_dir: Path, dataset_name: str, log: logging.Logger) -> None:
+    """Merge all per-slide JSONs into a parquet table (atomic write)."""
     features_dir = output_dir / "slide-level-features"
     json_files = sorted(features_dir.glob("*.json"))
     if not json_files:
@@ -314,7 +355,7 @@ def _merge_results(output_dir: Path, log: logging.Logger) -> None:
             log.warning(f"Could not parse {p.name}: {exc}")
 
     df = pd.DataFrame(rows)
-    parquet_path = output_dir / "gigatime_tcga_luad.parquet"
+    parquet_path = output_dir / f"gigatime_{dataset_name.replace('-', '_')}.parquet"
     tmp_path = parquet_path.with_suffix(".parquet.tmp")
     df.to_parquet(tmp_path, index=False)
     tmp_path.rename(parquet_path)
@@ -355,7 +396,10 @@ def _worker(
     log.info(f"Worker {rank} starting on {device}")
     model = load_model(device=device)
     model.eval()
-    log.info("Model ready.")
+
+    gpu_idx = rank if torch.cuda.is_available() else -1
+    matter_detector = BRUNet(gpu=gpu_idx)
+    log.info("Model + matter detector ready.")
 
     features_dir = output_dir / "slide-level-features"
     maps_root = output_dir / "maps"
@@ -378,6 +422,7 @@ def _worker(
             result = _process_slide(
                 uri,
                 model,
+                matter_detector,
                 device,
                 batch_size,
                 prefetch,
@@ -401,12 +446,6 @@ def _worker(
             f"{elapsed:.1f}s  ({tiles_per_sec:.1f} tiles/s)  → {out_path.name}"
         )
 
-        # Regenerate the merged parquet every MERGE_EVERY completed slides
-        # (counted across all workers via the total JSON count on disk).
-        n_done = sum(1 for _ in features_dir.glob("*.json"))
-        if n_done % MERGE_EVERY == 0:
-            log.info(f"  {n_done} slides done — refreshing parquet…")
-            _merge_results(output_dir, log)
 
     log.info(f"Worker {rank} done: {len(slide_times)} ok, {len(errors)} errors.")
     if errors:
@@ -420,16 +459,38 @@ def _worker(
 
 
 def main() -> None:
+    # Reduce CUDA allocator fragmentation — prevents OOM on small allocations
+    # when the allocator has free blocks of the wrong size cached.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     n_gpus = torch.cuda.device_count()
     default_workers = max(1, n_gpus)
 
-    parser = argparse.ArgumentParser(description="Extract GigaTIME features for TCGA-LUAD slides")
+    efs_root = Path(
+        "/home/sagemaker-user/custom-file-systems/efs/fs-09913c1f7db79b6fd"
+    )
+    preset_names = ", ".join(DATASET_PRESETS)
+
+    parser = argparse.ArgumentParser(
+        description="Extract GigaTIME spatial features for a WSI dataset",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help=f"Dataset name ({preset_names}) or an Abstra dataset UUID",
+    )
+    parser.add_argument(
+        "--slide-filter",
+        type=str,
+        default=None,
+        help="Only process slides whose path contains this substring (e.g. 'parafine')",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(
-            "/home/sagemaker-user/custom-file-systems/efs/fs-09913c1f7db79b6fd/gigatime_tcga_luad/outputs"
-        ),
+        default=None,
+        help="Output directory (default: EFS/<dataset>/outputs)",
     )
     parser.add_argument(
         "--num-workers",
@@ -463,7 +524,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    output_dir: Path = args.output_dir
+    # Resolve dataset hash and optional slide filter from presets or raw UUID.
+    dataset_key = args.dataset.lower()
+    if dataset_key in DATASET_PRESETS:
+        dataset_hash, default_filter = DATASET_PRESETS[dataset_key]
+        dataset_name = dataset_key
+    else:
+        dataset_hash = args.dataset
+        default_filter = None
+        dataset_name = dataset_hash[:8]
+
+    slide_filter = args.slide_filter if args.slide_filter is not None else default_filter
+
+    output_dir: Path = args.output_dir or (efs_root / f"gigatime_{dataset_name.replace('-', '_')}" / "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "slide-level-features").mkdir(exist_ok=True)
 
@@ -490,17 +563,20 @@ def main() -> None:
     log = logging.getLogger(__name__)
 
     log.info("=" * 60)
-    log.info("GigaTIME feature extraction — TCGA-LUAD")
+    log.info(f"GigaTIME feature extraction — {dataset_name}")
+    log.info(f"Dataset hash     : {dataset_hash}")
     log.info(f"Output directory : {output_dir.resolve()}")
     log.info(f"GPUs available   : {n_gpus}  |  Workers: {args.num_workers}")
     log.info(f"Batch size       : {args.batch_size}  |  Prefetch: {args.prefetch}")
     log.info(f"Map size         : {args.map_size}px  |  Channels: {len(ANALYSIS_CHANNELS)}")
+    if slide_filter:
+        log.info(f"Slide filter     : '{slide_filter}'")
 
     manifest = Manifest().load()
-    dataset = manifest.datasets[TCGA_LUAD]
-    all_slides = [
-        s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix) if "parafine" in s
-    ]
+    dataset = manifest.datasets[dataset_hash]
+    all_slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+    if slide_filter:
+        all_slides = [s for s in all_slides if slide_filter in s]
     if args.limit is not None:
         all_slides = all_slides[: args.limit]
 
@@ -512,7 +588,7 @@ def main() -> None:
 
     if not pending:
         log.info("Nothing to do — all slides already processed.")
-        _merge_results(output_dir, log)
+        _merge_results(output_dir, dataset_name, log)
         return
 
     wall_start = time.perf_counter()
@@ -539,7 +615,7 @@ def main() -> None:
     total_wall = time.perf_counter() - wall_start
     log.info(f"All workers finished — wall time {total_wall / 60:.1f} min")
 
-    _merge_results(output_dir, log)
+    _merge_results(output_dir, dataset_name, log)
 
 
 if __name__ == "__main__":

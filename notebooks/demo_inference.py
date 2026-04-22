@@ -16,8 +16,10 @@ from PIL import Image
 
 from tqdm import tqdm
 
+from tilingtool.filters.matter_detection import BRUNet
+
 from gigatime.data import SlideReader, iter_tiles, list_slides, stitch
-from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_OV, TCGA_LUAD
+from gigatime.data.paths import TCGA_LUAD, MOSAIC_NSCLC_UKER
 from gigatime.inference import load_model, predict, predict_batch
 from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
 
@@ -66,8 +68,8 @@ ALL_CANVAS_MAX_DIM = 1024
 
 # %%
 # --- Choose dataset ---
-AVAILABLE_DATASETS = [TCGA_LUAD, MOSAIC_BLCA, MOSAIC_OV]
-DATASET = AVAILABLE_DATASETS[0]  # change key to switch datasets
+AVAILABLE_DATASETS = [TCGA_LUAD, MOSAIC_NSCLC_UKER]
+DATASET = AVAILABLE_DATASETS[1]  # change key to switch datasets
 
 manifest = Manifest().load()
 dataset = manifest.datasets[DATASET]
@@ -80,9 +82,10 @@ for i, uri in enumerate(slides[:10]):
     print(f"  [{i}] {Path(uri).name}")
 
 # %%
-# Load the model
+# Load the model and matter detector
 model = load_model(device=DEVICE)
 model.eval()
+matter_detector = BRUNet(gpu=0 if DEVICE.startswith("cuda") else -1)
 print(f"Loaded — {len(CHANNEL_NAMES)} output channels: {', '.join(CHANNEL_NAMES)}")
 
 # %%
@@ -93,6 +96,8 @@ print(f"Opening: {Path(slide_uri).name}")
 reader = SlideReader(slide_uri)  # S3 URI — downloaded to a temp dir, cleaned up on close()
 w, h = reader.dimensions_at_read_level
 print(f"Slide at read level: {w} × {h} px  (mpp ≈ 0.5 µm/px)")
+matter_mask = matter_detector(reader._slide)
+print(f"Matter mask: {matter_mask.shape} (at 4 µm/px)")
 
 vis_canvas: dict[str, np.ndarray] = {}
 all_canvas: dict[str, np.ndarray] = {}
@@ -156,7 +161,7 @@ _step = 512  # default tile_size with no overlap
 _n_grid_tiles = max(1, -(-_w // _step)) * max(1, -(-_h // _step))  # ceil division
 
 with torch.inference_mode():
-    for tile, grid in tqdm(iter_tiles(reader, min_tissue_fraction=0.05), desc="Inference", total=_n_grid_tiles):
+    for tile, grid in tqdm(iter_tiles(reader, matter_mask=matter_mask), desc="Inference", total=_n_grid_tiles):
         if not vis_canvas:
             step = grid.tile_size - grid.overlap
             vis_scale = CANVAS_MAX_DIM / max(grid.slide_width, grid.slide_height)
@@ -321,9 +326,10 @@ for idx, uri in enumerate(slide_uris_batch):
         reader = SlideReader(uri)  # downloads to a temp dir, cleaned up on close()
         w, h = reader.dimensions_at_read_level
         print(f"         {w} × {h} px")
+        mm = matter_detector(reader._slide)
 
         with torch.inference_mode():
-            for tile, grid in iter_tiles(reader, min_tissue_fraction=0.05):
+            for tile, grid in iter_tiles(reader, matter_mask=mm):
                 predict(tile.array, model, device=DEVICE)
                 n_tiles += 1
 

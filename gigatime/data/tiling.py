@@ -67,6 +67,8 @@ def iter_tiles(
     tile_size: int = TILE_SIZE_PX,
     overlap: int = 0,
     min_tissue_fraction: float = 0.0,
+    matter_mask: np.ndarray | None = None,
+    matter_threshold: float = 0.6,
     progress: bool = False,
 ) -> Generator[tuple[Tile, TileGrid], None, None]:
     """Yield tiles from a slide together with the grid layout.
@@ -84,7 +86,15 @@ def iter_tiles(
         tile_size: Output tile size in pixels. Should be 512 for GigaTIME.
         overlap: Overlap between adjacent tiles in pixels.
         min_tissue_fraction: Skip tiles where the fraction of non-white pixels
-            is below this threshold.
+            is below this threshold.  Ignored when ``matter_mask`` is provided.
+        matter_mask: Optional tissue probability mask from tilingtool's
+            ``BRUNet()(slide)``, shape ``(W, H)`` at the detector's native
+            resolution.  When provided, tiles are filtered by the mean
+            probability in their region instead of the brightness-based
+            ``_has_tissue`` heuristic.
+        matter_threshold: Minimum mean probability in the mask region for a
+            tile to be considered tissue.  Only used when ``matter_mask`` is
+            provided.  Default 0.6 matches tilingtool's default.
         progress: If ``True``, display a tqdm progress bar.
 
     Yields:
@@ -116,6 +126,14 @@ def iter_tiles(
     native_w = reader.metadata.width
     l0_scale = native_w / slide_w
 
+    # If a matter mask is provided, precompute the scale from tile grid coords
+    # to mask coords.  The mask shape is (mask_w, mask_h) — note W×H order as
+    # returned by tilingtool's MatterFilter.
+    if matter_mask is not None:
+        mask_w, mask_h = matter_mask.shape
+        mask_scale_x = mask_w / slide_w
+        mask_scale_y = mask_h / slide_h
+
     coords = ((row, col) for row in range(n_rows) for col in range(n_cols))
     if progress:
         try:
@@ -125,6 +143,15 @@ def iter_tiles(
         coords = tqdm(coords, total=grid.n_tiles, unit="tile", desc="Tiling")
 
     for row, col in coords:
+        # --- Tissue filtering (before reading the tile for speed) ---
+        if matter_mask is not None:
+            y0_m = int(row * tile_size * mask_scale_y)
+            x0_m = int(col * tile_size * mask_scale_x)
+            y1_m = max(y0_m + 1, int(min((row + 1) * tile_size, slide_h) * mask_scale_y))
+            x1_m = max(x0_m + 1, int(min((col + 1) * tile_size, slide_w) * mask_scale_x))
+            if matter_mask[x0_m:x1_m, y0_m:y1_m].mean() < matter_threshold:
+                continue
+
         # DZG address is (col, row) — note the order
         img = dz.get_tile(dz_level, (col, row))
         region = np.array(img.convert("RGB"))
@@ -135,8 +162,10 @@ def iter_tiles(
             padded[: region.shape[0], : region.shape[1]] = region
             region = padded
 
-        if min_tissue_fraction > 0.0 and not _has_tissue(region, min_tissue_fraction):
-            continue
+        # Fall back to brightness heuristic when no matter mask is available.
+        if matter_mask is None and min_tissue_fraction > 0.0:
+            if not _has_tissue(region, min_tissue_fraction):
+                continue
 
         x0 = round(col * tile_size * l0_scale)
         y0 = round(row * tile_size * l0_scale)
