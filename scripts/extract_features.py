@@ -54,8 +54,6 @@ from abstra.manifest import Manifest
 from PIL import Image
 from tqdm import tqdm
 
-from tilingtool.filters.matter_detection import BRUNet
-
 from gigatime.data import SlideReader, iter_tiles, list_slides
 from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_NSCLC_UKER, MOSAIC_OV, TCGA_LUAD
 from gigatime.features import SlideFeatureAccumulator
@@ -116,13 +114,7 @@ FEATURE_CHANNELS = [
 # ---------------------------------------------------------------------------
 
 
-def _prefetch_tiles(
-    reader,
-    maxsize: int,
-    matter_mask: np.ndarray | None = None,
-    matter_threshold: float = 0.6,
-    min_tissue_fraction: float = 0.05,
-):
+def _prefetch_tiles(reader, maxsize: int, min_tissue_fraction: float = 0.05):
     """Yield (tile, grid) pairs — iter_tiles runs in a background thread.
 
     The thread is guaranteed to have exited (no outstanding OpenSlide reads)
@@ -135,12 +127,7 @@ def _prefetch_tiles(
 
     def _run() -> None:
         try:
-            for item in iter_tiles(
-                reader,
-                matter_mask=matter_mask,
-                matter_threshold=matter_threshold,
-                min_tissue_fraction=min_tissue_fraction,
-            ):
+            for item in iter_tiles(reader, min_tissue_fraction=min_tissue_fraction):
                 if stop.is_set():
                     break
                 q.put(item)
@@ -176,23 +163,33 @@ def _prefetch_tiles(
 def _process_slide(
     uri: str,
     model: torch.nn.Module,
-    matter_detector,
     device: str,
     batch_size: int,
     prefetch: int,
     maps_dir: Path,
     map_size: int,
+    min_tiles: int = 0,
 ) -> dict:
     """Run inference + feature extraction for one slide.
 
     Saves per-channel PNG maps to ``maps_dir``.
     Returns a dict with ``features``, ``channels``, ``metadata``, ``elapsed_s``.
+
+    Raises:
+        RuntimeError: If fewer than ``min_tiles`` tissue tiles are found.
     """
     reader = SlideReader(uri)
     w, h = reader.dimensions_at_read_level
 
-    # Compute matter mask once per slide (runs at 4 MPP, very fast).
-    matter_mask = matter_detector(reader._slide)
+    # Quick check: estimate total grid tiles from slide dimensions.
+    # If far below min_tiles, skip without iterating.
+    if min_tiles > 0:
+        est_grid = max(1, -(-w // 512)) * max(1, -(-h // 512))
+        if est_grid < min_tiles:
+            reader.close()
+            raise RuntimeError(
+                f"Only ~{est_grid} grid tiles (min_tiles={min_tiles}) — skipping small biopsy"
+            )
 
 
     grid = None
@@ -242,7 +239,7 @@ def _process_slide(
 
     try:
         with torch.inference_mode():
-            for tile, grid in _prefetch_tiles(reader, maxsize=prefetch, matter_mask=matter_mask):
+            for tile, grid in _prefetch_tiles(reader, maxsize=prefetch):
                 if acc is None:
                     acc = SlideFeatureAccumulator(grid)
                     slide_max = max(grid.slide_width, grid.slide_height)
@@ -375,6 +372,7 @@ def _worker(
     batch_size: int,
     prefetch: int,
     map_size: int,
+    min_tiles: int = 0,
 ) -> None:
     """Process slides assigned to this worker (pending[rank::num_workers])."""
     device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
@@ -396,10 +394,7 @@ def _worker(
     log.info(f"Worker {rank} starting on {device}")
     model = load_model(device=device)
     model.eval()
-
-    gpu_idx = rank if torch.cuda.is_available() else -1
-    matter_detector = BRUNet(gpu=gpu_idx)
-    log.info("Model + matter detector ready.")
+    log.info("Model ready.")
 
     features_dir = output_dir / "slide-level-features"
     maps_root = output_dir / "maps"
@@ -422,12 +417,12 @@ def _worker(
             result = _process_slide(
                 uri,
                 model,
-                matter_detector,
                 device,
                 batch_size,
                 prefetch,
                 maps_dir=maps_root / stem,
                 map_size=map_size,
+                min_tiles=min_tiles,
             )
         except Exception as exc:
             errors.append((name, str(exc)))
@@ -485,6 +480,12 @@ def main() -> None:
         type=str,
         default=None,
         help="Only process slides whose path contains this substring (e.g. 'parafine')",
+    )
+    parser.add_argument(
+        "--min-tiles",
+        type=int,
+        default=0,
+        help="Skip slides with fewer estimated tissue tiles (e.g. 1000 to skip biopsies)",
     )
     parser.add_argument(
         "--output-dir",
@@ -574,7 +575,12 @@ def main() -> None:
 
     manifest = Manifest().load()
     dataset = manifest.datasets[dataset_hash]
-    all_slides = list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+    # Exclude non-WSI files (e.g. Visium CytAssist captures).
+    _EXCLUDE = {"cytassist_image"}
+    all_slides = [
+        s for s in list_slides(bucket=dataset.bucket, prefix=dataset.prefix)
+        if Path(s).stem.lower() not in _EXCLUDE
+    ]
     if slide_filter:
         all_slides = [s for s in all_slides if slide_filter in s]
     if args.limit is not None:
@@ -600,6 +606,7 @@ def main() -> None:
         args.batch_size,
         args.prefetch,
         args.map_size,
+        args.min_tiles,
     )
 
     if args.num_workers == 1:

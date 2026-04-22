@@ -127,8 +127,8 @@ def iter_tiles(
     l0_scale = native_w / slide_w
 
     # If a matter mask is provided, precompute the scale from tile grid coords
-    # to mask coords.  The mask shape is (mask_w, mask_h) — note W×H order as
-    # returned by tilingtool's MatterFilter.
+    # to mask coords.  The mask shape is (W, H) as returned by tilingtool's
+    # MatterFilter (note: W×H order, not numpy's usual H×W).
     if matter_mask is not None:
         mask_w, mask_h = matter_mask.shape
         mask_scale_x = mask_w / slide_w
