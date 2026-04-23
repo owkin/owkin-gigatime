@@ -16,6 +16,7 @@ dependencies = [
     "owkin-sagemaker-toolbox",
     "owkin-tilingtoolv2>=11.16.1",
     "classic-algos",
+    "owkin-data-loader",
 ]
 
 [project.optional-dependencies]
@@ -51,13 +52,14 @@ dev = [
 [[tool.uv.index]]
 name = "codeartifact"
 url = "https://abstra-058264397262.d.codeartifact.eu-west-1.amazonaws.com/pypi/owkin-pypi/simple/"
-explicit = true
+explicit = false
 
 [tool.uv.sources]
 owkin-sagemaker-toolbox = { index = "codeartifact" }
 owkin-abstra = { index = "codeartifact" }
 owkin-tilingtoolv2 = { index = "codeartifact" }
 classic-algos = { index = "codeartifact" }
+owkin-data-loader = { index = "codeartifact" }
 
 [project.scripts]
 gigatime-infer = "gigatime.cli:main"

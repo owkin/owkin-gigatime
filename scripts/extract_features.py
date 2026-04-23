@@ -20,8 +20,7 @@ Available datasets
 -------------------
     tcga-luad           TCGA Lung Adenocarcinoma (parafine H&E)
     mosaic-nsclc-uker   MOSAIC NSCLC UKER
-    mosaic-ov           MOSAIC Ovarian Cancer
-    mosaic-blca         MOSAIC Bladder Cancer
+    mosaic-bladder-chuv MOSAIC CHUV Bladder
     <uuid>              Any Abstra dataset hash directly
 
 Output
@@ -55,7 +54,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from gigatime.data import SlideReader, iter_tiles, list_slides
-from gigatime.data.paths import MOSAIC_BLCA, MOSAIC_NSCLC_UKER, MOSAIC_OV, TCGA_LUAD
+from gigatime.data.paths import (
+    MOSAIC_BLCA,
+    MOSAIC_BLADDER_CHUV,
+    MOSAIC_NSCLC_UKER,
+    MOSAIC_OV,
+    TCGA_LUAD,
+)
 from gigatime.features import SlideFeatureAccumulator
 from gigatime.inference import load_model, predict_batch
 from gigatime.inference.constants import BACKGROUND_CHANNELS, CHANNEL_NAMES
@@ -68,6 +73,7 @@ DATASET_PRESETS: dict[str, tuple[str, str | None]] = {
     "mosaic-nsclc-uker": (MOSAIC_NSCLC_UKER, None),
     "mosaic-ov": (MOSAIC_OV, None),
     "mosaic-blca": (MOSAIC_BLCA, None),
+    "mosaic-bladder-chuv": (MOSAIC_BLADDER_CHUV, None),
 }
 
 # Per-channel mIF display colors (RGB). Black background, signal in channel color.
